@@ -16,11 +16,10 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-#include "GPU_OpenGL.h"
-
 #include <assert.h>
 #include <string.h>
 #include <algorithm>
+#include <new>
 
 #include "Utils.h"
 #include "Platform.h"
@@ -34,12 +33,8 @@ namespace melonDS
 using Platform::Log;
 using Platform::LogLevel;
 
-// sentinels matching the GL compute renderer's (GLuint)-1/-2 capture markers
-static VulkanTexArray* const kCaptureTex128 = (VulkanTexArray*)(uintptr_t)-1;
-static VulkanTexArray* const kCaptureTex256 = (VulkanTexArray*)(uintptr_t)-2;
-
-ComputeRenderer3D_Vulkan::ComputeRenderer3D_Vulkan(melonDS::GPU3D& gpu3D, GLRenderer* parent)
-    : Renderer3D(gpu3D), Parent(parent), Texcache(gpu3D.GPU, TexcacheVulkanLoader(&Ctx))
+ComputeRenderer3D_Vulkan::ComputeRenderer3D_Vulkan(melonDS::GPU3D& gpu3D, VK::Context& ctx)
+    : Renderer3D(gpu3D), Ctx(ctx), Texcache(gpu3D.GPU, TexcacheVulkanLoader(&Ctx))
 {
     ScaleFactor = 0;
     HiresCoordinates = false;
@@ -79,7 +74,10 @@ bool ComputeRenderer3D_Vulkan::CompileShader(VkPipeline& pipeline, const std::st
 
     VkShaderModule module = VK_NULL_HANDLE;
     if (!Ctx.CompileComputeShader(module, shaderSource, shaderName.c_str()))
+    {
+        ShaderCompilationFailed = true;
         return false;
+    }
 
     VkComputePipelineCreateInfo pipelineInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -95,6 +93,7 @@ bool ComputeRenderer3D_Vulkan::CompileShader(VkPipeline& pipeline, const std::st
     {
         Log(LogLevel::Error, "Vulkan: failed to create pipeline %s (%d)\n", shaderName.c_str(), res);
         pipeline = VK_NULL_HANDLE;
+        ShaderCompilationFailed = true;
         return false;
     }
     return true;
@@ -102,9 +101,15 @@ bool ComputeRenderer3D_Vulkan::CompileShader(VkPipeline& pipeline, const std::st
 
 void ComputeRenderer3D_Vulkan::ShaderCompileStep(int& current, int& count)
 {
+    count = 33;
+    if (ShaderCompilationFailed || ShaderStepIdx >= count)
+    {
+        current = std::min(ShaderStepIdx, count);
+        return;
+    }
+
     current = ShaderStepIdx;
     ShaderStepIdx++;
-    count = 33;
     switch (current)
     {
     case 0:
@@ -213,12 +218,6 @@ void ComputeRenderer3D_Vulkan::ShaderCompileStep(int& current, int& count)
 
 bool ComputeRenderer3D_Vulkan::Init()
 {
-    if (!Ctx.Init())
-    {
-        Log(LogLevel::Error, "Vulkan compute renderer: no usable Vulkan implementation, falling back\n");
-        return false;
-    }
-
     // fixed-size buffers
     if (!Ctx.CreateBuffer(YSpanSetupMemory, sizeof(SpanSetupY)*MaxYSpanSetups,
                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
@@ -288,14 +287,18 @@ bool ComputeRenderer3D_Vulkan::Init()
         return false;
 
     const u32 zeroPixel = 0;
-    Ctx.UploadImageLayer(DummyTexture, &zeroPixel, 1, 1, 0, 4);
-    Ctx.UploadImageLayer(DummyCapture, &zeroPixel, 1, 1, 0, 4);
+    if (!Ctx.UploadImageLayer(DummyTexture, &zeroPixel, 1, 1, 0, 4) ||
+        !Ctx.UploadImageLayer(DummyCapture, &zeroPixel, 1, 1, 0, 4))
+        return false;
     {
         // move the clear bitmap images into a shader-readable state before first use
         u32* zeroes = new u32[256*256]();
-        Ctx.UploadImageLayer(ClearBitmapImg[0], zeroes, 256, 256, 0, 4);
-        Ctx.UploadImageLayer(ClearBitmapImg[1], zeroes, 256, 256, 0, 4);
+        const bool uploaded = Ctx.UploadImageLayer(
+            ClearBitmapImg[0], zeroes, 256, 256, 0, 4) &&
+            Ctx.UploadImageLayer(ClearBitmapImg[1], zeroes, 256, 256, 0, 4);
         delete[] zeroes;
+        if (!uploaded)
+            return false;
     }
 
     // descriptor set layouts
@@ -439,11 +442,7 @@ ComputeRenderer3D_Vulkan::~ComputeRenderer3D_Vulkan()
         if (SetLayoutStatic) VK::vkDestroyDescriptorSetLayout(Ctx.Device, SetLayoutStatic, nullptr);
         if (SetLayoutTexture) VK::vkDestroyDescriptorSetLayout(Ctx.Device, SetLayoutTexture, nullptr);
 
-        Ctx.Deinit();
     }
-
-    if (OutputGLTex)
-        glDeleteTextures(1, &OutputGLTex);
 
     delete[] ClearBitmap[0];
     delete[] ClearBitmap[1];
@@ -510,16 +509,40 @@ void ComputeRenderer3D_Vulkan::DestroyScaleDependentResources()
     Ctx.DestroyImage(FramebufferImg);
 }
 
+bool ComputeRenderer3D_Vulkan::ReclaimSubmission()
+{
+    if (!SubmitPending)
+        return true;
+
+    VkResult result = VK::vkWaitForFences(
+        Ctx.Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: frame fence wait failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return false;
+    }
+    result = VK::vkResetFences(Ctx.Device, 1, &FrameFence);
+    if (result != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: frame fence reset failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return false;
+    }
+
+    SubmitPending = false;
+    return true;
+}
+
 void ComputeRenderer3D_Vulkan::Reset()
 {
-    if (Ctx.Valid)
-        VK::vkDeviceWaitIdle(Ctx.Device);
-    if (SubmitPending)
+    if (Ctx.Valid && VK::vkDeviceWaitIdle(Ctx.Device) != VK_SUCCESS)
     {
-        // device is idle; drop the deferred fence so it starts clean
-        VK::vkResetFences(Ctx.Device, 1, &FrameFence);
-        SubmitPending = false;
+        RenderResourcesValid = false;
+        return;
     }
+    if (!ReclaimSubmission())
+        return;
     Texcache.Reset();
     ClearBitmapDirty = 0x3;
     ReadbackValid = false;
@@ -611,7 +634,7 @@ void ComputeRenderer3D_Vulkan::SetCaptureImages(VkImageView cap128, VkImageView 
 
 VkDescriptorSet ComputeRenderer3D_Vulkan::GetTextureDescriptorSet(VkImageView view, VkSampler sampler)
 {
-    u64 key = (u64)(uintptr_t)view * 31 + (u64)(uintptr_t)sampler;
+    const std::array<uintptr_t, 2> key = {(uintptr_t)view, (uintptr_t)sampler};
     auto it = FrameTextureSets.find(key);
     if (it != FrameTextureSets.end())
         return it->second;
@@ -654,14 +677,38 @@ void ComputeRenderer3D_Vulkan::ComputeToComputeBarrier(bool indirect)
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-void ComputeRenderer3D_Vulkan::SetRenderSettings(int scale, bool highResolutionCoordinates)
+bool ComputeRenderer3D_Vulkan::SetRenderSettings(int scale, bool highResolutionCoordinates)
 {
     if (!Ctx.Valid)
-        return;
+        return false;
+
+    // High-resolution coordinates only affect the CPU-side vertex setup.
+    // Do not tear down the entire rasteriser when the allocation dimensions
+    // are unchanged; parent/2D descriptor sets retain FramebufferImg.View.
+    if (scale == ScaleFactor && FramebufferImg.Img != VK_NULL_HANDLE)
+    {
+        HiresCoordinates = highResolutionCoordinates;
+        return RenderResourcesValid;
+    }
 
     u8 TileScale;
 
-    VK::vkDeviceWaitIdle(Ctx.Device);
+    if (VK::vkDeviceWaitIdle(Ctx.Device) != VK_SUCCESS)
+    {
+        RenderResourcesValid = false;
+        return false;
+    }
+    if (SubmitPending)
+    {
+        if (VK::vkResetFences(Ctx.Device, 1, &FrameFence) != VK_SUCCESS)
+        {
+            RenderResourcesValid = false;
+            return false;
+        }
+        SubmitPending = false;
+    }
+
+    RenderResourcesValid = false;
 
     if (ScaleFactor != -1)
     {
@@ -670,6 +717,7 @@ void ComputeRenderer3D_Vulkan::SetRenderSettings(int scale, bool highResolutionC
     }
 
     ShaderStepIdx = 0;
+    ShaderCompilationFailed = false;
 
     ScaleFactor = scale;
     ScreenWidth = 256 * ScaleFactor;
@@ -695,76 +743,104 @@ void ComputeRenderer3D_Vulkan::SetRenderSettings(int scale, bool highResolutionC
 
     MaxWorkTiles = TilesPerLine*TileLines*16;
 
-    for (int i = 0; i < tilememoryLayer_Num; i++)
-        Ctx.CreateBuffer(TileMemory[i], (VkDeviceSize)4*TileSize*TileSize*MaxWorkTiles,
-                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    const VkPhysicalDeviceLimits& limits = Ctx.Props.limits;
+    if ((u32)TileSize > limits.maxComputeWorkGroupSize[0] ||
+        (u32)TileSize > limits.maxComputeWorkGroupSize[1] ||
+        (u32)(TileSize * TileSize) > limits.maxComputeWorkGroupInvocations)
+    {
+        Log(LogLevel::Error,
+            "GPU3D_ComputeVulkan: %dx%d compute tiles exceed device workgroup limits\n",
+            TileSize, TileSize);
+        ScaleFactor = -1;
+        ScreenWidth = 0;
+        ScreenHeight = 0;
+        return false;
+    }
 
-    Ctx.CreateBuffer(FinalTileMemory, (VkDeviceSize)4*3*2*ScreenWidth*ScreenHeight,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    auto fail = [&](const char* resource)
+    {
+        Log(LogLevel::Error,
+            "GPU3D_ComputeVulkan: failed to allocate scale-dependent %s at %dx\n",
+            resource, scale);
+        DestroyScaleDependentResources();
+        ScaleFactor = -1;
+        ScreenWidth = 0;
+        ScreenHeight = 0;
+        return false;
+    };
+
+    for (int i = 0; i < tilememoryLayer_Num; i++)
+        if (!Ctx.CreateBuffer(TileMemory[i], (VkDeviceSize)4*TileSize*TileSize*MaxWorkTiles,
+                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false))
+            return fail("tile memory");
+
+    if (!Ctx.CreateBuffer(FinalTileMemory, (VkDeviceSize)4*3*2*ScreenWidth*ScreenHeight,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false))
+        return fail("final tile memory");
 
     VkDeviceSize binResultSize = sizeof(BinResultHeader)
         + (VkDeviceSize)TilesPerLine*TileLines*CoarseBinStride*4 // BinnedMaskCoarse
         + (VkDeviceSize)TilesPerLine*TileLines*BinStride*4 // BinnedMask
         + (VkDeviceSize)TilesPerLine*TileLines*BinStride*4; // WorkOffsets
-    Ctx.CreateBuffer(BinResultMemory, binResultSize,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false);
+    if (!Ctx.CreateBuffer(BinResultMemory, binResultSize,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false))
+        return fail("bin results");
 
-    Ctx.CreateBuffer(WorkDescMemory, (VkDeviceSize)MaxWorkTiles*2*4*2,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    if (!Ctx.CreateBuffer(WorkDescMemory, (VkDeviceSize)MaxWorkTiles*2*4*2,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false))
+        return fail("work descriptors");
 
-    // eh those are pretty bad guesses
-    // though real hw shouldn't be eable to render all 2048 polygons on every line either
-    int maxYSpanIndices = 64*2048 * ScaleFactor;
-    YSpanIndices.resize(maxYSpanIndices);
+    const size_t maxYSpanIndices = (size_t)(ScreenHeight + 1) * 2048;
+    try
+    {
+        YSpanIndices.resize(maxYSpanIndices);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return fail("Y-span host storage");
+    }
 
-    Ctx.CreateBuffer(YSpanIndicesMemory, (VkDeviceSize)maxYSpanIndices*2*4,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
-    Ctx.CreateBuffer(XSpanSetupMemory, (VkDeviceSize)sizeof(SpanSetupX)*maxYSpanIndices,
-                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    if (!Ctx.CreateBuffer(YSpanIndicesMemory, (VkDeviceSize)maxYSpanIndices*sizeof(SetupIndices),
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true))
+        return fail("Y-span indices");
+    if (!Ctx.CreateBuffer(XSpanSetupMemory, (VkDeviceSize)sizeof(SpanSetupX)*maxYSpanIndices,
+                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false))
+        return fail("X-span setup");
 
-    Ctx.CreateImage(FramebufferImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenWidth, ScreenHeight, 1,
-                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false);
+    if (!Ctx.CreateImage(FramebufferImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenWidth, ScreenHeight, 1,
+                         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT, false))
+        return fail("framebuffer");
 
-    Ctx.CreateBuffer(ReadbackBuffer, (VkDeviceSize)ScreenWidth*ScreenHeight*4,
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    if (!Ctx.CreateBuffer(ReadbackBuffer, (VkDeviceSize)ScreenWidth*ScreenHeight*4,
+                          VK_BUFFER_USAGE_TRANSFER_DST_BIT, true))
+        return fail("readback buffer");
 
     // storage images live in GENERAL layout
     {
         VkCommandBuffer cmd = Ctx.BeginOneShot();
+        if (cmd == VK_NULL_HANDLE)
+            return fail("layout command buffer");
         Ctx.TransitionImage(cmd, FramebufferImg, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-        Ctx.EndOneShot(cmd);
+        if (!Ctx.EndOneShot(cmd))
+            return fail("layout submission");
     }
 
     UpdateStaticDescriptorSet();
 
-    if (VulkanNativeOutput)
-    {
-        // the all-Vulkan parent samples FramebufferImg directly; leave it in
-        // SHADER_READ_ONLY_OPTIMAL so the first frame's barrier is a no-op
-        VkCommandBuffer cmd = Ctx.BeginOneShot();
-        Ctx.TransitionImage(cmd, FramebufferImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        Ctx.EndOneShot(cmd);
-        return;
-    }
-
-    // (re)create the GL texture the compositor reads the 3D layer from
-    if (OutputGLTex)
-        glDeleteTextures(1, &OutputGLTex);
-    glGenTextures(1, &OutputGLTex);
-    glBindTexture(GL_TEXTURE_2D, OutputGLTex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, ScreenWidth, ScreenHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-
-    if (Parent)
-        Parent->OutputTex3D = OutputGLTex;
+    // The 2D compositor samples this image directly between frames.
+    VkCommandBuffer cmd = Ctx.BeginOneShot();
+    if (cmd == VK_NULL_HANDLE)
+        return fail("output layout command buffer");
+    Ctx.TransitionImage(cmd, FramebufferImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (!Ctx.EndOneShot(cmd))
+        return fail("output layout submission");
+    RenderResourcesValid = true;
+    return true;
 }
 
 void ComputeRenderer3D_Vulkan::SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to)
@@ -970,33 +1046,41 @@ void ComputeRenderer3D_Vulkan::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, P
 
 struct VulkanRenderVariant
 {
+    enum class TextureSource : u8
+    {
+        None,
+        Cache,
+        Capture128,
+        Capture256,
+    };
+
+    TextureSource Source;
     VulkanTexArray* Texture;
     u32 Sampler;
     u16 Width, Height;
     u8 BlendMode;
     int CaptureYOffset;
 
-    bool operator==(const VulkanRenderVariant& other)
+    bool operator==(const VulkanRenderVariant& other) const noexcept
     {
-        return Texture == other.Texture && Sampler == other.Sampler && BlendMode == other.BlendMode &&
-               CaptureYOffset == other.CaptureYOffset;
+        return Source == other.Source && Texture == other.Texture && Sampler == other.Sampler &&
+               Width == other.Width && Height == other.Height &&
+               BlendMode == other.BlendMode && CaptureYOffset == other.CaptureYOffset;
     }
 };
 
 void ComputeRenderer3D_Vulkan::RenderFrame()
 {
-    assert(!NeedsShaderCompile());
     ReadbackValid = false;
+    if (!Ctx.Valid || !RenderResourcesValid || ShaderCompilationFailed ||
+        NeedsShaderCompile())
+        return;
 
     // deferred wait: reclaim the previous native-output frame before touching
     // any per-frame resource (texture cache, descriptor pool, command buffer).
     // The previous 3D submit finished early on the queue, so this rarely blocks.
-    if (SubmitPending)
-    {
-        VK::vkWaitForFences(Ctx.Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
-        VK::vkResetFences(Ctx.Device, 1, &FrameFence);
-        SubmitPending = false;
-    }
+    if (!ReclaimSubmission())
+        return;
 
     u8 clrBitmapDirty;
     if (!Texcache.Update(clrBitmapDirty) && GPU3D.RenderFrameIdentical)
@@ -1026,7 +1110,8 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                 ClearBitmap[0][i] = r | (g << 8) | (b << 16) | (a << 24);
             }
 
-            Ctx.UploadImageLayer(ClearBitmapImg[0], ClearBitmap[0], 256, 256, 0, 4);
+            if (Ctx.UploadImageLayer(ClearBitmapImg[0], ClearBitmap[0], 256, 256, 0, 4))
+                ClearBitmapDirty &= ~(1 << 0);
         }
 
         if (ClearBitmapDirty & (1<<1))
@@ -1041,10 +1126,9 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                 ClearBitmap[1][i] = depth | fog;
             }
 
-            Ctx.UploadImageLayer(ClearBitmapImg[1], ClearBitmap[1], 256, 256, 0, 4);
+            if (Ctx.UploadImageLayer(ClearBitmapImg[1], ClearBitmap[1], 256, 256, 0, 4))
+                ClearBitmapDirty &= ~(1 << 1);
         }
-
-        ClearBitmapDirty = 0;
     }
 
     int numYSpans = 0;
@@ -1085,8 +1169,11 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
         {
             VulkanRenderVariant variant;
             variant.BlendMode = polygon->IsShadowMask ? 4 : ((polygon->Attr >> 4) & 0x3);
+            variant.Source = VulkanRenderVariant::TextureSource::None;
             variant.Texture = nullptr;
             variant.Sampler = 0;
+            variant.Width = TextureWidth(polygon->TexParam);
+            variant.Height = TextureHeight(polygon->TexParam);
             variant.CaptureYOffset = -1;
             u32* textureLastVariant = nullptr;
             // we always need to look up the texture to get the layer of the array texture
@@ -1118,19 +1205,17 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
 
                 if (capblock != -1)
                 {
-                    // the parent's capture output is sampled through bindings
-                    // 14/15 (SetCaptureImages) in the all-Vulkan renderer; in
-                    // the hybrid GL+ComputeVulkan mode those live in GL with no
-                    // Vulkan-importable handle, so a transparent dummy is used
+                    // The parent's capture output is sampled through bindings
+                    // 14/15 populated by SetCaptureImages.
                     if (texwidth == 128)
                     {
-                        variant.Texture = kCaptureTex128;
+                        variant.Source = VulkanRenderVariant::TextureSource::Capture128;
                         variant.CaptureYOffset = (int)((texaddr >> 5) & 0x7F);
                         prevTexLayer = capblock;
                     }
                     else
                     {
-                        variant.Texture = kCaptureTex256;
+                        variant.Source = VulkanRenderVariant::TextureSource::Capture256;
                         variant.CaptureYOffset = (int)((texaddr >> 6) & 0xFF);
                         prevTexLayer = capblock >> 2;
                     }
@@ -1139,7 +1224,15 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                 }
                 else
                 {
-                    Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant);
+                    if (!Texcache.GetTexture(polygon->TexParam, polygon->TexPalette,
+                                             variant.Texture, prevTexLayer,
+                                             textureLastVariant))
+                    {
+                        Log(LogLevel::Error, "GPU3D_ComputeVulkan: texture upload failed\n");
+                        RenderResourcesValid = false;
+                        return;
+                    }
+                    variant.Source = VulkanRenderVariant::TextureSource::Cache;
                     variant.CaptureYOffset = -1;
                 }
 
@@ -1168,12 +1261,14 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                     }
                 }
 
+                if (numVariants >= MaxVariants)
+                {
+                    Log(LogLevel::Error, "GPU3D_ComputeVulkan: too many texture variants\n");
+                    return;
+                }
                 prevVariant = numVariants;
                 variants[numVariants] = variant;
-                variants[numVariants].Width = TextureWidth(polygon->TexParam);
-                variants[numVariants].Height = TextureHeight(polygon->TexParam);
                 numVariants++;
-                assert(numVariants <= MaxVariants);
             foundVariant:;
 
                 if (textureLastVariant)
@@ -1241,6 +1336,11 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
             u32 curSpanR = numYSpans;
             SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, vbot, 1, scaledPositions);
 
+            if ((size_t)numSetupIndices >= YSpanIndices.size())
+            {
+                Log(LogLevel::Error, "GPU3D_ComputeVulkan: too many Y-span indices\n");
+                return;
+            }
             YSpanIndices[numSetupIndices].PolyIdx = i;
             YSpanIndices[numSetupIndices].SpanIdxL = curSpanL;
             YSpanIndices[numSetupIndices].SpanIdxR = curSpanR;
@@ -1306,6 +1406,11 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                     SetupYSpan(&RenderPolygons[i] ,&YSpanSetups[numYSpans++], polygon, curVR, nextVR, 1, scaledPositions);
                 }
 
+                if ((size_t)numSetupIndices >= YSpanIndices.size())
+                {
+                    Log(LogLevel::Error, "GPU3D_ComputeVulkan: too many Y-span indices\n");
+                    return;
+                }
                 YSpanIndices[numSetupIndices].PolyIdx = i;
                 YSpanIndices[numSetupIndices].SpanIdxL = curSpanL;
                 YSpanIndices[numSetupIndices].SpanIdxR = curSpanR;
@@ -1382,24 +1487,63 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
     }
     memcpy(MetaUniformMemory.Map, &meta, sizeof(MetaUniform));
 
+    bool mappedBuffersReady = Ctx.FlushBuffer(MetaUniformMemory, 0, sizeof(MetaUniform));
+    if (numYSpans > 0)
+    {
+        mappedBuffersReady &= Ctx.FlushBuffer(
+            YSpanSetupMemory, 0, sizeof(SpanSetupY) * numYSpans);
+        mappedBuffersReady &= Ctx.FlushBuffer(
+            YSpanIndicesMemory, 0, (VkDeviceSize)numSetupIndices * sizeof(SetupIndices));
+        mappedBuffersReady &= Ctx.FlushBuffer(
+            RenderPolygonMemory, 0,
+            (VkDeviceSize)GPU3D.RenderNumPolygons * sizeof(RenderPolygon));
+    }
+    if (!mappedBuffersReady)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: failed to publish mapped buffers\n");
+        RenderResourcesValid = false;
+        return;
+    }
+
     // fresh descriptor sets for this frame's textures
-    VK::vkResetDescriptorPool(Ctx.Device, DescPoolFrame, 0);
+    VkResult result = VK::vkResetDescriptorPool(Ctx.Device, DescPoolFrame, 0);
+    if (result != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: descriptor pool reset failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return;
+    }
     FrameTextureSets.clear();
     VkDescriptorSet dummyTextureSet = GetTextureDescriptorSet(DummyTexture.View, Samplers[0]);
+    if (dummyTextureSet == VK_NULL_HANDLE)
+    {
+        RenderResourcesValid = false;
+        return;
+    }
 
     // record the frame
+    result = VK::vkResetCommandBuffer(FrameCmd, 0);
+    if (result != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: command buffer reset failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return;
+    }
     VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK::vkBeginCommandBuffer(FrameCmd, &beginInfo);
-
-    if (VulkanNativeOutput)
+    result = VK::vkBeginCommandBuffer(FrameCmd, &beginInfo);
+    if (result != VK_SUCCESS)
     {
-        // the storage-image final pass needs GENERAL; the 2D compositor left
-        // it in SHADER_READ_ONLY after sampling last frame's output
-        Ctx.TransitionImage(FrameCmd, FramebufferImg, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: command buffer begin failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return;
     }
+
+    // The storage-image final pass needs GENERAL; the 2D compositor left it
+    // shader-readable after sampling the previous frame's output.
+    Ctx.TransitionImage(FrameCmd, FramebufferImg, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
 
     VK::vkCmdBindDescriptorSets(FrameCmd, VK_PIPELINE_BIND_POINT_COMPUTE, PipelineLayout,
         0, 1, &SetStatic, 0, nullptr);
@@ -1477,7 +1621,7 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                 pc.CaptureYOffset = 0.f;
                 pc.FilterTex = TexFilter ? 1 : 0;
 
-                if (variants[i].Texture == nullptr)
+                if (variants[i].Source == VulkanRenderVariant::TextureSource::None)
                 {
                     shader = shadersNoTexture[variants[i].BlendMode];
                 }
@@ -1485,12 +1629,13 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
                 {
                     shader = shadersUseTexture[variants[i].BlendMode];
 
-                    if (variants[i].CaptureYOffset != -1)
+                    if (variants[i].Source == VulkanRenderVariant::TextureSource::Capture128 ||
+                        variants[i].Source == VulkanRenderVariant::TextureSource::Capture256)
                     {
-                        pc.TexIsCapture = variants[i].Width == 128 ? 1 : 2;
+                        pc.TexIsCapture = variants[i].Source == VulkanRenderVariant::TextureSource::Capture128 ? 1 : 2;
                         pc.CaptureYOffset = (float)variants[i].CaptureYOffset / (float)variants[i].Height;
                     }
-                    else if (variants[i].Texture != kCaptureTex128 && variants[i].Texture != kCaptureTex256)
+                    else if (variants[i].Texture && variants[i].Texture->Valid)
                     {
                         texSet = GetTextureDescriptorSet(variants[i].Texture->Image.View, Samplers[variants[i].Sampler]);
                         if (texSet == VK_NULL_HANDLE)
@@ -1535,59 +1680,32 @@ void ComputeRenderer3D_Vulkan::RenderFrame()
     VK::vkCmdBindPipeline(FrameCmd, VK_PIPELINE_BIND_POINT_COMPUTE, ShaderFinalPass[finalPassShader]);
     VK::vkCmdDispatch(FrameCmd, ScreenWidth/32, ScreenHeight, 1);
 
-    if (VulkanNativeOutput)
+    // Leave the output sampleable by the 2D compositor. Same-queue ordering
+    // makes the image available without a CPU-side wait here.
+    Ctx.TransitionImage(FrameCmd, FramebufferImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+
+    result = VK::vkEndCommandBuffer(FrameCmd);
+    if (result != VK_SUCCESS)
     {
-        // leave the output sampleable by the 2D compositor; the parent
-        // fence-waits on the same queue before recording its 2D work
-        Ctx.TransitionImage(FrameCmd, FramebufferImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-
-        VK::vkEndCommandBuffer(FrameCmd);
-
-        VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &FrameCmd;
-        VK::vkQueueSubmit(Ctx.Queue, 1, &submitInfo, FrameFence);
-
-        // pipelined: do not wait here. The fence is reclaimed at the top of the
-        // next RenderFrame; same-queue ordering lets the 2D compositor sample
-        // the output image safely without a CPU stall.
-        SubmitPending = true;
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: command buffer end failed (%d)\n", result);
+        RenderResourcesValid = false;
         return;
     }
-
-    // read the frame back for the GL compositor
-    Ctx.TransitionImage(FrameCmd, FramebufferImg, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {(u32)ScreenWidth, (u32)ScreenHeight, 1};
-    VK::vkCmdCopyImageToBuffer(FrameCmd, FramebufferImg.Img, VK_IMAGE_LAYOUT_GENERAL,
-        ReadbackBuffer.Buf, 1, &region);
-
-    VkMemoryBarrier hostBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    VK::vkCmdPipelineBarrier(FrameCmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-        0, 1, &hostBarrier, 0, nullptr, 0, nullptr);
-
-    VK::vkEndCommandBuffer(FrameCmd);
 
     VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &FrameCmd;
-    VK::vkQueueSubmit(Ctx.Queue, 1, &submitInfo, FrameFence);
+    result = VK::vkQueueSubmit(Ctx.Queue, 1, &submitInfo, FrameFence);
+    if (result != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "GPU3D_ComputeVulkan: frame submit failed (%d)\n", result);
+        RenderResourcesValid = false;
+        return;
+    }
 
-    VK::vkWaitForFences(Ctx.Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
-    VK::vkResetFences(Ctx.Device, 1, &FrameFence);
-
-    // hand the finished frame to the GL compositor
-    glBindTexture(GL_TEXTURE_2D, OutputGLTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ScreenWidth, ScreenHeight,
-        GL_RGBA, GL_UNSIGNED_BYTE, ReadbackBuffer.Map);
+    SubmitPending = true;
 }
 
 void ComputeRenderer3D_Vulkan::RestartFrame()
@@ -1596,7 +1714,8 @@ void ComputeRenderer3D_Vulkan::RestartFrame()
 
 u32* ComputeRenderer3D_Vulkan::GetLine(int line)
 {
-    if (GPU3D.AbortFrame)
+    if (GPU3D.AbortFrame || !Ctx.Valid || !RenderResourcesValid ||
+        ShaderCompilationFailed || NeedsShaderCompile())
     {
         memset(ReadbackLine, 0, sizeof(ReadbackLine));
         return ReadbackLine;
@@ -1604,14 +1723,18 @@ u32* ComputeRenderer3D_Vulkan::GetLine(int line)
 
     if (!ReadbackValid)
     {
-        if (SubmitPending)
+        if (!ReclaimSubmission())
         {
-            VK::vkWaitForFences(Ctx.Device, 1, &FrameFence, VK_TRUE, UINT64_MAX);
-            VK::vkResetFences(Ctx.Device, 1, &FrameFence);
-            SubmitPending = false;
+            memset(ReadbackLine, 0, sizeof(ReadbackLine));
+            return ReadbackLine;
         }
 
         VkCommandBuffer cmd = Ctx.BeginOneShot();
+        if (cmd == VK_NULL_HANDLE)
+        {
+            memset(ReadbackLine, 0, sizeof(ReadbackLine));
+            return ReadbackLine;
+        }
         Ctx.TransitionImage(cmd, FramebufferImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -1631,7 +1754,17 @@ u32* ComputeRenderer3D_Vulkan::GetLine(int line)
         Ctx.TransitionImage(cmd, FramebufferImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
-        Ctx.EndOneShot(cmd);
+        if (!Ctx.EndOneShot(cmd))
+        {
+            memset(ReadbackLine, 0, sizeof(ReadbackLine));
+            return ReadbackLine;
+        }
+        if (!Ctx.InvalidateBuffer(ReadbackBuffer))
+        {
+            RenderResourcesValid = false;
+            memset(ReadbackLine, 0, sizeof(ReadbackLine));
+            return ReadbackLine;
+        }
         ReadbackValid = true;
     }
 

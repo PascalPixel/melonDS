@@ -18,7 +18,9 @@
 
 #include "VulkanSupport.h"
 
+#include <algorithm>
 #include <string.h>
+#include <mutex>
 
 #include "Platform.h"
 
@@ -42,6 +44,11 @@ using Platform::Log;
 using Platform::LogLevel;
 
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+static std::once_flag RuntimeLoadOnce;
+static bool RuntimeLoaded = false;
+static void* RuntimeLibrary = nullptr;
+static std::mutex GlslangMutex;
+static u32 GlslangUsers = 0;
 
 #define VK_DEFINE_FUNC(name) PFN_##name name = nullptr;
 VK_FOREACH_GLOBAL_FUNC(VK_DEFINE_FUNC)
@@ -111,28 +118,43 @@ bool IsRuntimeAvailable()
 
 bool Context::LoadLibrary()
 {
-    if (LibVulkan)
-        return true;
-
-    LibVulkan = OpenLibrary();
-    if (!LibVulkan)
+    std::call_once(RuntimeLoadOnce, []
     {
-        Log(LogLevel::Info, "Vulkan: no Vulkan library found\n");
-        return false;
-    }
+        RuntimeLibrary = OpenLibrary();
+        if (!RuntimeLibrary)
+        {
+            Log(LogLevel::Info, "Vulkan: no Vulkan library found\n");
+            return;
+        }
 
-    vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetLibSymbol(LibVulkan, "vkGetInstanceProcAddr");
-    if (!vkGetInstanceProcAddr)
-    {
-        Log(LogLevel::Error, "Vulkan: library has no vkGetInstanceProcAddr\n");
-        return false;
-    }
+        vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetLibSymbol(
+            RuntimeLibrary, "vkGetInstanceProcAddr");
 
-#define VK_LOAD_GLOBAL(name) name = (PFN_##name)vkGetInstanceProcAddr(nullptr, #name);
-    VK_FOREACH_GLOBAL_FUNC(VK_LOAD_GLOBAL)
-#undef VK_LOAD_GLOBAL
+        // Exported loader/ICD trampolines dispatch from their handle argument
+        // and are valid across every Context. Device-specific pointers from
+        // vkGetDeviceProcAddr cannot safely be stored process-globally.
+#define VK_LOAD_EXPORTED(name) name = (PFN_##name)GetLibSymbol(RuntimeLibrary, #name);
+        VK_FOREACH_GLOBAL_FUNC(VK_LOAD_EXPORTED)
+        VK_FOREACH_INSTANCE_FUNC(VK_LOAD_EXPORTED)
+        VK_FOREACH_DEVICE_FUNC(VK_LOAD_EXPORTED)
+#undef VK_LOAD_EXPORTED
 
-    return vkCreateInstance != nullptr;
+        bool complete = vkGetInstanceProcAddr != nullptr;
+#define VK_CHECK_EXPORTED(name) complete = complete && name != nullptr;
+        VK_FOREACH_GLOBAL_FUNC(VK_CHECK_EXPORTED)
+        VK_FOREACH_INSTANCE_FUNC(VK_CHECK_EXPORTED)
+        VK_FOREACH_DEVICE_FUNC(VK_CHECK_EXPORTED)
+#undef VK_CHECK_EXPORTED
+
+        if (!complete)
+        {
+            Log(LogLevel::Error, "Vulkan: library is missing required core entry points\n");
+            return;
+        }
+        RuntimeLoaded = true;
+    });
+
+    return RuntimeLoaded;
 }
 
 Context::~Context()
@@ -196,10 +218,6 @@ bool Context::Init()
         return false;
     }
 
-#define VK_LOAD_INSTANCE(name) name = (PFN_##name)vkGetInstanceProcAddr(Instance, #name);
-    VK_FOREACH_INSTANCE_FUNC(VK_LOAD_INSTANCE)
-#undef VK_LOAD_INSTANCE
-
     // physical device
 
     u32 numPhysDevs = 0;
@@ -213,13 +231,34 @@ bool Context::Init()
     std::vector<VkPhysicalDevice> physDevs(numPhysDevs);
     vkEnumeratePhysicalDevices(Instance, &numPhysDevs, physDevs.data());
 
-    // prefer a discrete GPU, then integrated, then whatever comes first
-    PhysDev = physDevs[0];
+    // The full renderer records both compute and graphics commands on this
+    // queue. Pick the best device that actually exposes such a queue rather
+    // than selecting a device first and accepting a compute-only family.
+    PhysDev = VK_NULL_HANDLE;
     int bestScore = -1;
     for (VkPhysicalDevice dev : physDevs)
     {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(dev, &props);
+
+        u32 numQueueFamilies = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(dev, &numQueueFamilies, nullptr);
+        std::vector<VkQueueFamilyProperties> queueFamilies(numQueueFamilies);
+        vkGetPhysicalDeviceQueueFamilyProperties(dev, &numQueueFamilies, queueFamilies.data());
+
+        u32 compatibleQueue = UINT32_MAX;
+        for (u32 i = 0; i < numQueueFamilies; i++)
+        {
+            constexpr VkQueueFlags required = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
+            if ((queueFamilies[i].queueFlags & required) == required)
+            {
+                compatibleQueue = i;
+                break;
+            }
+        }
+        if (compatibleQueue == UINT32_MAX)
+            continue;
+
         int score = 0;
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 2;
         else if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 1;
@@ -227,7 +266,15 @@ bool Context::Init()
         {
             bestScore = score;
             PhysDev = dev;
+            QueueFamily = compatibleQueue;
         }
+    }
+
+    if (PhysDev == VK_NULL_HANDLE)
+    {
+        Log(LogLevel::Error, "Vulkan: no graphics+compute queue\n");
+        Deinit();
+        return false;
     }
 
     vkGetPhysicalDeviceProperties(PhysDev, &Props);
@@ -236,29 +283,6 @@ bool Context::Init()
     Log(LogLevel::Info, "Vulkan: using device %s (Vulkan %d.%d)\n",
         Props.deviceName,
         VK_VERSION_MAJOR(Props.apiVersion), VK_VERSION_MINOR(Props.apiVersion));
-
-    // queue family with compute + transfer
-    u32 numQueueFamilies = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(PhysDev, &numQueueFamilies, nullptr);
-    std::vector<VkQueueFamilyProperties> queueFamilies(numQueueFamilies);
-    vkGetPhysicalDeviceQueueFamilyProperties(PhysDev, &numQueueFamilies, queueFamilies.data());
-
-    bool foundQueue = false;
-    for (u32 i = 0; i < numQueueFamilies; i++)
-    {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
-        {
-            QueueFamily = i;
-            foundQueue = true;
-            break;
-        }
-    }
-    if (!foundQueue)
-    {
-        Log(LogLevel::Error, "Vulkan: no compute queue\n");
-        Deinit();
-        return false;
-    }
 
     // device
 
@@ -309,10 +333,6 @@ bool Context::Init()
         return false;
     }
 
-#define VK_LOAD_DEVICE(name) name = (PFN_##name)vkGetDeviceProcAddr(Device, #name);
-    VK_FOREACH_DEVICE_FUNC(VK_LOAD_DEVICE)
-#undef VK_LOAD_DEVICE
-
     vkGetDeviceQueue(Device, QueueFamily, 0, &Queue);
 
     VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -325,13 +345,17 @@ bool Context::Init()
         return false;
     }
 
-    if (!glslang::InitializeProcess())
     {
-        Log(LogLevel::Error, "Vulkan: failed to initialise glslang\n");
-        Deinit();
-        return false;
+        std::lock_guard<std::mutex> lock(GlslangMutex);
+        if (GlslangUsers == 0 && !glslang::InitializeProcess())
+        {
+            Log(LogLevel::Error, "Vulkan: failed to initialise glslang\n");
+            Deinit();
+            return false;
+        }
+        GlslangUsers++;
+        OwnsGlslang = true;
     }
-    OwnsGlslang = true;
 
     Valid = true;
     return true;
@@ -350,7 +374,9 @@ void Context::Deinit()
 
     if (OwnsGlslang)
     {
-        glslang::FinalizeProcess();
+        std::lock_guard<std::mutex> lock(GlslangMutex);
+        if (--GlslangUsers == 0)
+            glslang::FinalizeProcess();
         OwnsGlslang = false;
     }
 
@@ -375,6 +401,11 @@ u32 Context::FindMemoryType(u32 typeBits, VkMemoryPropertyFlags wanted)
 
 bool Context::CreateBuffer(Buffer& buf, VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible)
 {
+    if (size == 0 ||
+        ((usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) &&
+         size > Props.limits.maxStorageBufferRange))
+        return false;
+
     VkBufferCreateInfo bufInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufInfo.size = size;
     bufInfo.usage = usage;
@@ -391,6 +422,8 @@ bool Context::CreateBuffer(Buffer& buf, VkDeviceSize size, VkBufferUsageFlags us
     {
         memType = FindMemoryType(memReq.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (memType == UINT32_MAX)
+            memType = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
     }
     else
     {
@@ -414,9 +447,17 @@ bool Context::CreateBuffer(Buffer& buf, VkDeviceSize size, VkBufferUsageFlags us
         buf.Buf = VK_NULL_HANDLE;
         return false;
     }
-    vkBindBufferMemory(Device, buf.Buf, buf.Mem, 0);
+    if (vkBindBufferMemory(Device, buf.Buf, buf.Mem, 0) != VK_SUCCESS)
+    {
+        vkFreeMemory(Device, buf.Mem, nullptr);
+        vkDestroyBuffer(Device, buf.Buf, nullptr);
+        buf = {};
+        return false;
+    }
 
     buf.Size = size;
+    buf.AllocationSize = memReq.size;
+    buf.MemoryFlags = MemProps.memoryTypes[memType].propertyFlags;
     buf.Map = nullptr;
     if (hostVisible)
     {
@@ -441,9 +482,69 @@ void Context::DestroyBuffer(Buffer& buf)
     buf = {};
 }
 
+static VkMappedMemoryRange MappedRange(const Context::Buffer& buf,
+                                       VkDeviceSize offset, VkDeviceSize size,
+                                       VkDeviceSize atomSize)
+{
+    const VkDeviceSize end = size == VK_WHOLE_SIZE
+        ? buf.AllocationSize
+        : std::min(offset + size, buf.AllocationSize);
+    const VkDeviceSize alignedOffset = offset - (offset % atomSize);
+    VkDeviceSize alignedEnd = ((end + atomSize - 1) / atomSize) * atomSize;
+    alignedEnd = std::min(alignedEnd, buf.AllocationSize);
+
+    VkMappedMemoryRange range = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    range.memory = buf.Mem;
+    range.offset = alignedOffset;
+    range.size = alignedEnd - alignedOffset;
+    return range;
+}
+
+bool Context::FlushBuffer(const Buffer& buf, VkDeviceSize offset, VkDeviceSize size)
+{
+    if (!buf.Map || !buf.Mem)
+        return false;
+    if (buf.MemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        return true;
+
+    VkMappedMemoryRange range = MappedRange(buf, offset, size, Props.limits.nonCoherentAtomSize);
+    return vkFlushMappedMemoryRanges(Device, 1, &range) == VK_SUCCESS;
+}
+
+bool Context::InvalidateBuffer(const Buffer& buf, VkDeviceSize offset, VkDeviceSize size)
+{
+    if (!buf.Map || !buf.Mem)
+        return false;
+    if (buf.MemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        return true;
+
+    VkMappedMemoryRange range = MappedRange(buf, offset, size, Props.limits.nonCoherentAtomSize);
+    return vkInvalidateMappedMemoryRanges(Device, 1, &range) == VK_SUCCESS;
+}
+
 bool Context::CreateImage(Image& img, VkFormat format, u32 width, u32 height, u32 layers,
                           VkImageUsageFlags usage, bool array2D)
 {
+    if (width == 0 || height == 0 || layers == 0 ||
+        width > Props.limits.maxImageDimension2D ||
+        height > Props.limits.maxImageDimension2D ||
+        layers > Props.limits.maxImageArrayLayers)
+        return false;
+
+    VkFormatProperties formatProps;
+    vkGetPhysicalDeviceFormatProperties(PhysDev, format, &formatProps);
+    VkFormatFeatureFlags requiredFeatures = 0;
+    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT)
+        requiredFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT)
+        requiredFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+        requiredFeatures |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+        requiredFeatures |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    if ((formatProps.optimalTilingFeatures & requiredFeatures) != requiredFeatures)
+        return false;
+
     VkImageCreateInfo imgInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
     imgInfo.format = format;
@@ -481,7 +582,13 @@ bool Context::CreateImage(Image& img, VkFormat format, u32 width, u32 height, u3
         img.Img = VK_NULL_HANDLE;
         return false;
     }
-    vkBindImageMemory(Device, img.Img, img.Mem, 0);
+    if (vkBindImageMemory(Device, img.Img, img.Mem, 0) != VK_SUCCESS)
+    {
+        vkFreeMemory(Device, img.Mem, nullptr);
+        vkDestroyImage(Device, img.Img, nullptr);
+        img = {};
+        return false;
+    }
 
     VkImageViewCreateInfo viewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = img.Img;
@@ -545,50 +652,89 @@ VkCommandBuffer Context::BeginOneShot()
 
     VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(Device, CmdPool, 1, &cmd);
+        return VK_NULL_HANDLE;
+    }
     return cmd;
 }
 
-void Context::EndOneShot(VkCommandBuffer cmd)
+bool Context::EndOneShot(VkCommandBuffer cmd)
 {
-    vkEndCommandBuffer(cmd);
+    if (cmd == VK_NULL_HANDLE || vkEndCommandBuffer(cmd) != VK_SUCCESS)
+    {
+        if (cmd != VK_NULL_HANDLE)
+            vkFreeCommandBuffers(Device, CmdPool, 1, &cmd);
+        return false;
+    }
 
     // wait only for this submission via a fence, not the whole queue:
     // vkQueueWaitIdle drains every in-flight (pipelined) frame too
-    VkFence fence;
+    VkFence fence = VK_NULL_HANDLE;
     VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    vkCreateFence(Device, &fenceInfo, nullptr, &fence);
+    if (vkCreateFence(Device, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
+    {
+        vkFreeCommandBuffers(Device, CmdPool, 1, &cmd);
+        return false;
+    }
 
     VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(Queue, 1, &submitInfo, fence);
-    vkWaitForFences(Device, 1, &fence, VK_TRUE, UINT64_MAX);
+    VkResult result = vkQueueSubmit(Queue, 1, &submitInfo, fence);
+    if (result != VK_SUCCESS)
+    {
+        vkDestroyFence(Device, fence, nullptr);
+        vkFreeCommandBuffers(Device, CmdPool, 1, &cmd);
+        return false;
+    }
+
+    result = vkWaitForFences(Device, 1, &fence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS)
+    {
+        // The submission may still own cmd and anything it references. Do
+        // not destroy those objects after a failed wait; device teardown will
+        // reclaim them after vkDeviceWaitIdle/vkDestroyDevice.
+        Log(LogLevel::Error, "Vulkan: one-shot fence wait failed (%d)\n", result);
+        Valid = false;
+        return false;
+    }
 
     vkDestroyFence(Device, fence, nullptr);
     vkFreeCommandBuffers(Device, CmdPool, 1, &cmd);
+    return true;
 }
 
-void Context::UploadImageLayer(Image& img, const void* data, u32 width, u32 height, u32 layer, u32 bytesPerPixel)
+bool Context::UploadImageLayer(Image& img, const void* data, u32 width, u32 height,
+                               u32 layer, u32 bytesPerPixel,
+                               VkPipelineStageFlags consumerStages)
 {
     VkDeviceSize size = (VkDeviceSize)width * height * bytesPerPixel;
 
     Buffer staging;
     if (!CreateBuffer(staging, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true))
-        return;
+        return false;
     memcpy(staging.Map, data, size);
+    if (!FlushBuffer(staging, 0, size))
+    {
+        DestroyBuffer(staging);
+        return false;
+    }
 
     VkCommandBuffer cmd = BeginOneShot();
     if (cmd == VK_NULL_HANDLE)
     {
         DestroyBuffer(staging);
-        return;
+        return false;
     }
 
     // the whole image (all layers) moves through TRANSFER_DST; individual layer
     // uploads keep the image in SHADER_READ_ONLY between them
+    const bool undefined = img.Layout == VK_IMAGE_LAYOUT_UNDEFINED;
     TransitionImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
+        undefined ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : consumerStages,
+        undefined ? 0 : VK_ACCESS_SHADER_READ_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 
     VkBufferImageCopy region = {};
@@ -598,10 +744,12 @@ void Context::UploadImageLayer(Image& img, const void* data, u32 width, u32 heig
 
     TransitionImage(cmd, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        consumerStages, VK_ACCESS_SHADER_READ_BIT);
 
-    EndOneShot(cmd);
-    DestroyBuffer(staging);
+    const bool submitted = EndOneShot(cmd);
+    if (submitted || Valid)
+        DestroyBuffer(staging);
+    return submitted;
 }
 
 bool Context::CompileShader(VkShaderModule& out, ShaderStage stage, const std::string& source, const char* name)
@@ -734,27 +882,15 @@ bool Context::CreateFramebufferMulti(VkFramebuffer& out, VkRenderPass renderPass
 
 bool Context::CreateFramebuffer(VkFramebuffer& out, VkRenderPass renderPass, const Image& target, u32 layer)
 {
-    // a framebuffer needs a single-layer view even for array images
-    VkImageView view = target.View;
-    VkImageView layerView = VK_NULL_HANDLE;
-    if (target.Layers > 1)
-    {
-        VkImageViewCreateInfo viewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewInfo.image = target.Img;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = target.Format;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
-        if (vkCreateImageView(Device, &viewInfo, nullptr, &layerView) != VK_SUCCESS)
-            return false;
-        view = layerView;
-        // NOTE: caller owns the framebuffer; the layer view leaks with it by
-        // design here — track both if churn ever matters
-    }
+    // Array targets need a separately-owned single-layer view. Requiring
+    // callers to create and retain that view keeps its lifetime explicit.
+    if (target.Layers != 1 || layer != 0)
+        return false;
 
     VkFramebufferCreateInfo info = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     info.renderPass = renderPass;
     info.attachmentCount = 1;
-    info.pAttachments = &view;
+    info.pAttachments = &target.View;
     info.width = target.Width;
     info.height = target.Height;
     info.layers = 1;

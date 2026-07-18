@@ -19,48 +19,35 @@
 #ifndef GPU3D_COMPUTEVULKAN
 #define GPU3D_COMPUTEVULKAN
 
+#include <array>
+#include <map>
 #include <memory>
-#include <unordered_map>
 #include <vector>
 
 #include "types.h"
 
 #include "GPU3D.h"
 
-#include "OpenGLSupport.h"
 #include "VulkanSupport.h"
 
 #include "GPU3D_TexcacheVulkan.h"
 
 namespace melonDS
 {
-class GLRenderer;
-
 // Vulkan port of ComputeRenderer3D (the OpenGL 4.3 compute-shader
-// rasteriser). Renders through a self-contained Vulkan device, then hands
-// the finished frame to the OpenGL compositor by uploading it into a GL
-// texture. This is what makes the "modern" renderer available on macOS,
-// where OpenGL is capped below 4.3 but Vulkan works through MoltenVK.
+// rasteriser). Its output image is consumed directly by VulkanRenderer2D.
 class ComputeRenderer3D_Vulkan : public Renderer3D
 {
 public:
-    // parent is only used for the GL-interop path (hybrid GLRenderer +
-    // ComputeVulkan 3D); pass nullptr when SetVulkanNativeOutput(true) is
-    // used (the all-Vulkan parent never dereferences it)
-    ComputeRenderer3D_Vulkan(melonDS::GPU3D& gpu3D, GLRenderer* parent);
+    ComputeRenderer3D_Vulkan(melonDS::GPU3D& gpu3D, VK::Context& ctx);
     ~ComputeRenderer3D_Vulkan() override;
     bool Init() override;
     void Reset() override;
 
-    void SetRenderSettings(int scale, bool highResolutionCoordinates);
+    bool SetRenderSettings(int scale, bool highResolutionCoordinates);
 
-    // when the parent is the all-Vulkan renderer, the 3D output stays a
-    // Vulkan image (no GL interop / readback). RenderFrame() then leaves
-    // FramebufferImg in SHADER_READ_ONLY_OPTIMAL, fence-waited, ready for
-    // the 2D compositor to sample. Must be set before SetRenderSettings().
-    void SetVulkanNativeOutput(bool native) { VulkanNativeOutput = native; }
     const VK::Context::Image& GetOutputImage() const { return FramebufferImg; }
-    VK::Context& GetContext() { return Ctx; }
+    bool IsRenderValid() const { return RenderResourcesValid && !ShaderCompilationFailed; }
 
     // hand the parent renderer's display-capture output images (128- and
     // 256-wide array textures) to the rasteriser so polygons that use a
@@ -76,13 +63,12 @@ public:
     void RestartFrame() override;
     u32* GetLine(int line) override;
 
-    bool NeedsShaderCompile() override { return ShaderStepIdx != 33; }
+    bool NeedsShaderCompile() override { return !ShaderCompilationFailed && ShaderStepIdx != 33; }
+    bool ShaderCompileFailed() const override { return ShaderCompilationFailed; }
     void ShaderCompileStep(int& current, int& count) override;
 
 private:
-    GLRenderer* Parent;
-
-    VK::Context Ctx;
+    VK::Context& Ctx;
 
     // pipelines (same variant set as the GL compute renderer)
     VkPipeline ShaderInterpXSpans[2] = {};
@@ -154,6 +140,7 @@ private:
     // and reclaim the fence at the start of the next RenderFrame, so the 2D
     // compositor's next-frame wait no longer serialises behind this one
     bool SubmitPending = false;
+    bool RenderResourcesValid = false;
 
     struct SpanSetupY
     {
@@ -248,7 +235,7 @@ private:
         u32 SortWorkWorkCount[4];
     };
 
-    static const int MaxYSpanSetups = 6144*2;
+    static constexpr int MaxYSpanSetups = 2048 * 10;
     std::vector<SetupIndices> YSpanIndices;
     SpanSetupY YSpanSetups[MaxYSpanSetups];
     RenderPolygon RenderPolygons[2048];
@@ -275,9 +262,6 @@ private:
     u32* ClearBitmap[2] = {};
     u8 ClearBitmapDirty = 0;
 
-    GLuint OutputGLTex = 0;
-    bool VulkanNativeOutput = false;
-
     int ScreenWidth = 0, ScreenHeight = 0;
     int TilesPerLine = 0, TileLines = 0;
     int ScaleFactor = -1;
@@ -285,9 +269,11 @@ private:
     bool HiresCoordinates = false;
 
     int ShaderStepIdx = 0;
+    bool ShaderCompilationFailed = false;
 
     void DeleteShaders();
     void DestroyScaleDependentResources();
+    bool ReclaimSubmission();
 
     void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);
     void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2]);
@@ -300,7 +286,7 @@ private:
     void ComputeToComputeBarrier(bool indirect);
 
     // per-frame descriptor set cache, cleared each frame
-    std::unordered_map<u64, VkDescriptorSet> FrameTextureSets;
+    std::map<std::array<uintptr_t, 2>, VkDescriptorSet> FrameTextureSets;
 };
 
 }

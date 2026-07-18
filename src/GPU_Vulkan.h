@@ -73,6 +73,9 @@ public:
 
     void DrawScanline(u32 line) override;
     void DrawSprites(u32 line) override;
+    void Start3DRendering() override;
+    void Finish3DRendering() override;
+    void Restart3DRendering() override;
 
     void VBlank(u32 endLine) override;
     void VBlankEnd() override;
@@ -80,12 +83,14 @@ public:
 
     void SwapBuffers() override;
 
-    void AllocCapture(u32 bank, u32 start, u32 len) override;
+    void AllocCapture(u32 bank, u32 start, u32 len,
+                      bool preserveContents) override;
     void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override;
 
     bool GetFramebuffers(void** top, void** bottom) override;
 
     bool NeedsShaderCompile() override;
+    bool ShaderCompileFailed() const override;
     void ShaderCompileStep(int& current, int& count) override;
 
 private:
@@ -93,16 +98,16 @@ private:
 
     u32* GetLine3D(int line) { return Rend3D->GetLine(line); }
 
-    // borrowed from Rend3D (which owns the VK::Context); shared with
-    // Rend2D_A/B, set once construction of Rend3D has happened
-    VK::Context* Ctx = nullptr;
+    // The top-level renderer owns the device shared by its 2D and 3D
+    // children. They keep references only and are destroyed before this.
+    std::unique_ptr<VK::Context> Ctx;
 
     int ScaleFactor;
     int ScreenW, ScreenH;
 
     // optional additive enhancements (off => accuracy-exact)
     bool EnableDither = false;
-    bool EnableTexFilter = false;
+    bool RenderResourcesValid = false;
 
     // ---- per-frame command buffer plumbing ----
     // own submission, entirely separate from Rend3D's FrameCmd/FrameFence.
@@ -121,11 +126,12 @@ private:
     // out-of-band flush (see .cpp for why)
     VkCommandBuffer CurCmd = VK_NULL_HANDLE;
 
-    void EnsureFrameStarted();
-    void SubmitAndWaitFrame(); // ends + submits + fence-waits current slot; clears FrameStarted
-    void SubmitFramePipelined(); // ends + submits current slot without waiting (wait deferred)
-    void PrepareMappedBuffersForSubmit();
-    void FlushMappedBuffers();
+    bool ReclaimFrameSlot(int slot);
+    bool EnsureFrameStarted();
+    bool SubmitAndWaitFrame(); // ends + submits + fence-waits current slot; clears FrameStarted
+    bool SubmitFramePipelined(); // ends + submits current slot without waiting (wait deferred)
+    bool PrepareMappedBuffersForSubmit();
+    bool FlushMappedBuffers();
 
     // generic per-frame linear allocator (vertex data, staging uploads),
     // mirrors VulkanRenderer2D::sRingBuffer
@@ -153,7 +159,7 @@ private:
         bool Overflowed = false;
     };
     bool InitConfigRing(sConfigRing& ring, u32 size, u32 slots);
-    void PushConfig(sConfigRing& ring, const void* data, u32 size);
+    bool PushConfig(sConfigRing& ring, const void* data, u32 size);
 
     void BeginColorTarget(VK::Context::Image& img);
     void EndColorTarget(VK::Context::Image& img);
@@ -245,6 +251,7 @@ private:
         u32 uSrcBUseVCount;
         u32 __pad0[2];
     } CaptureConfig;
+    bool CaptureLineValid[192] = {};
 
     VkDescriptorSetLayout CaptureSetLayout = VK_NULL_HANDLE;
     VkPipelineLayout CapturePipelineLayout = VK_NULL_HANDLE;
@@ -261,8 +268,10 @@ private:
     std::map<std::array<uintptr_t, 2>, VkDescriptorSet> CaptureDescCache;
 
     VK::Context::Image CaptureOutput256Img;       // RGBA8 array, 4 layers (one per VRAM bank)
+    VkImageView CaptureOutput256View[4] = {};
     VkFramebuffer CaptureOutput256FB[4] = {};
     VK::Context::Image CaptureOutput128Img;       // RGBA8 array, 16 layers (4 banks x 4 offsets)
+    VkImageView CaptureOutput128View[16] = {};
     VkFramebuffer CaptureOutput128FB[16] = {};
     VK::Context::Image CaptureVRAMImg;            // RGBA8 array, 1 layer; same-bank hazard temp
 
@@ -298,7 +307,7 @@ private:
     int LastCapLine;
     int Aux0VRAMCap;
 
-    void SetScaleFactor(int scale);
+    bool SetScaleFactor(int scale);
     void DestroyScaleDependentResources();
     void InvalidateCaptureDescCache();
 

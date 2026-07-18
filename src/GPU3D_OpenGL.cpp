@@ -484,7 +484,8 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
     return vptr;
 }
 
-void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int npolys, int captureinfo[16])
+bool GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons,
+                                 int npolys, int captureinfo[16])
 {
     u32* vptr = &VertexBuffer[0];
     u32 vidx = 0;
@@ -563,7 +564,9 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 else
                 {
                     u32* halp;
-                    Texcache.GetTexture(texparam, texpal, curtexid, curtexlayer, halp);
+                    if (!Texcache.GetTexture(texparam, texpal, curtexid,
+                                             curtexlayer, halp))
+                        return false;
                     curtexlayer |= 0xFFFF0000;
                 }
             }
@@ -775,6 +778,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     NumVertices = vidx;
     NumIndices = iidx;
     NumEdgeIndices = eidx - EdgeIndicesOffset;
+    return true;
 }
 
 void GLRenderer3D::SetupPolygonTexture(const RendererPolygon* poly) const
@@ -1475,7 +1479,11 @@ void GLRenderer3D::RenderFrame()
         NumFinalPolys = npolys;
         NumOpaqueFinalPolys = firsttrans;
 
-        BuildPolygons(&PolygonList[0], npolys, captureinfo);
+        if (!BuildPolygons(&PolygonList[0], npolys, captureinfo))
+        {
+            GPU3D.AbortFrame = true;
+            return;
+        }
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
 

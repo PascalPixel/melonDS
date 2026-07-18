@@ -1,9 +1,8 @@
-name: Vulkan (Linux)
+name: Vulkan
 
-# Compile-coverage for the Vulkan renderer against a real, non-MoltenVK
-# Vulkan/glslang stack. The renderer is developed on macOS/MoltenVK; this
-# leg catches any Apple- or MoltenVK-specific assumption that would not
-# build against upstream Vulkan headers and glslang on Linux.
+# Linux compiles and executes a headless renderer smoke test against
+# lavapipe and the Vulkan validation layers. Windows provides compile
+# coverage for the dynamically-loaded Vulkan path there as well.
 
 on:
   push:
@@ -30,8 +29,62 @@ jobs:
             libpcap0.8-dev libsdl2-dev libenet-dev \
             qt6-{base,base-private,multimedia}-dev qt6-wayland libqt6svg6-dev \
             libarchive-dev libzstd-dev libfaad-dev \
-            libvulkan-dev glslang-tools glslang-dev spirv-tools
+            libvulkan-dev glslang-tools glslang-dev spirv-tools \
+            mesa-vulkan-drivers vulkan-validationlayers
       - name: Configure (Vulkan renderer on)
-        run: cmake -B build -G Ninja -DENABLE_VKRENDERER=ON
+        run: >-
+          cmake -B build -G Ninja
+          -DENABLE_VKRENDERER=ON
+          -DBUILD_TESTING=ON
+          -DENABLE_VULKAN_SMOKE_TEST=ON
       - name: Build
         run: cmake --build build
+      - name: Test with lavapipe and validation layers
+        shell: bash
+        run: |
+          set -euo pipefail
+          LVP_ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$LVP_ICD"
+          TEST_LOG=$(mktemp)
+          VK_DRIVER_FILES="$LVP_ICD" \
+          VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation \
+          VK_LOADER_DEBUG=layer \
+          VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT \
+            ctest --test-dir build --verbose -L vulkan 2>&1 | tee "$TEST_LOG"
+          if ! grep -Eq 'Insert instance layer "?VK_LAYER_KHRONOS_validation' "$TEST_LOG"; then
+            echo 'The Khronos validation layer was not activated' >&2
+            exit 1
+          fi
+          if grep -E 'Validation Error|VUID-[A-Za-z0-9_-]+|SYNC-HAZARD' "$TEST_LOG"; then
+            exit 1
+          fi
+
+  vulkan-windows-build:
+    name: Windows x86_64 (ENABLE_VKRENDERER)
+    runs-on: windows-2025-vs2026
+    env:
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg_cache,readwrite
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+      - name: Restore vcpkg cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: vcpkg-vulkan-x86_64-windows-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-vulkan-x86_64-windows-
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgJsonGlob: vcpkg.json
+      - name: Configure and build
+        uses: lukka/run-cmake@v10
+        with:
+          configurePreset: release-windows-x86_64
+          configurePresetAdditionalArgs: "['-DENABLE_DEBUG_DEPS=OFF', '-DENABLE_VKRENDERER=ON', '-DVCPKG_MANIFEST_FEATURES=vulkan']"
+          buildPreset: release-windows-x86_64
+      - name: Save vcpkg cache
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/vcpkg_cache
+          key: vcpkg-vulkan-x86_64-windows-${{ hashFiles('vcpkg.json') }}

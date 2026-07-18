@@ -311,6 +311,8 @@ void GPU::DoSavestate(Savestate* file) noexcept
     }
 
     Rend->PostSavestate();
+    if (!file->Saving)
+        RendererFramePublished = false;
 }
 
 
@@ -343,6 +345,7 @@ void GPU::SetRenderer(std::unique_ptr<Renderer>&& renderer) noexcept
     ResetVRAMCache();
     OAMDirty = 0x3;
     PaletteDirty = 0x5F;
+    RendererFramePublished = false;
 }
 
 
@@ -1596,6 +1599,7 @@ void GPU::CheckCaptureStart()
 
     // if needed, invalidate old captures
     u16* cbflags = &VRAMCaptureBlockFlags[dstbank << 2];
+    bool preserveContents = true;
     u32 b = dstoff;
     for (u32 i = 0; i < len; i++)
     {
@@ -1603,12 +1607,17 @@ void GPU::CheckCaptureStart()
         b = (b + 1) & 0x3;
 
         if (!(oldflags & CBFlag_IsCapture))
+        {
+            preserveContents = false;
             continue;
+        }
 
         u32 oldstart = oldflags & 0x3;
         u32 oldsize = (oldflags >> 6) & 0x3;
         if (oldstart == dstoff && oldsize == size)
             continue;
+
+        preserveContents = false;
 
         // we have an old capture here, and it was at a different offset/size
         // sync it and invalidate it
@@ -1620,7 +1629,7 @@ void GPU::CheckCaptureStart()
     // mark involved VRAM blocks as being a new capture
     u16 newval = CBFlag_IsCapture | dstoff | (dstbank << 2) | (len << 4) | (size << 6);
     VRAMCBFlagsSet(dstbank, dstoff, newval);
-    Rend->AllocCapture(dstbank, dstoff, size);
+    Rend->AllocCapture(dstbank, dstoff, size, preserveContents);
 }
 
 void GPU::CheckCaptureEnd()
@@ -1682,14 +1691,16 @@ void GPU::SyncAllVRAMCaptures()
         u16 flags = VRAMCaptureBlockFlags[b];
         if (!(flags & CBFlag_IsCapture))
             continue;
-        if (flags & CBFlag_Synced)
-            continue;
 
         u32 bank = b >> 2;
         u32 start = flags & 0x3;
         u32 len = (flags >> 6) & 0x3;
 
-        Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete));
+        // A synced capture is already authoritative in CPU VRAM, but its
+        // ownership still belongs to the current renderer. Always retire the
+        // tracking entry when all renderer capture state is being discarded.
+        if (!(flags & CBFlag_Synced))
+            Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete));
         VRAMCBFlagsClear(bank, start);
     }
 }

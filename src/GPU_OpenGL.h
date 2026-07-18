@@ -24,9 +24,6 @@
 #include "GPU2D_OpenGL.h"
 #include "GPU3D_OpenGL.h"
 #include "GPU3D_Compute.h"
-#ifdef VKRENDERER_ENABLED
-#include "GPU3D_ComputeVulkan.h"
-#endif
 
 namespace melonDS
 {
@@ -35,7 +32,6 @@ enum class Renderer3DType
 {
     OpenGL,        // classic rasteriser (OpenGL 3.2)
     Compute,       // compute-shader rasteriser (OpenGL 4.3)
-    ComputeVulkan, // compute-shader rasteriser (Vulkan), 2D still composited in GL
 };
 
 class GLRenderer : public Renderer
@@ -60,7 +56,8 @@ public:
 
     void SwapBuffers() override;
 
-    void AllocCapture(u32 bank, u32 start, u32 len) override;
+    void AllocCapture(u32 bank, u32 start, u32 len,
+                      bool preserveContents) override;
     void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override;
 
     bool GetFramebuffers(void** top, void** bottom) override;
@@ -72,13 +69,10 @@ private:
     friend class GLRenderer2D;
     friend class GLRenderer3D;
     friend class ComputeRenderer3D;
-#ifdef VKRENDERER_ENABLED
-    friend class ComputeRenderer3D_Vulkan;
-#endif
 
     Renderer3DType Type3D;
 
-    bool CanReadback3D() const { return Type3D == Renderer3DType::OpenGL; }
+    bool CanReadback3D() const { return true; }
     u32* GetLine3D(int line) { return Rend3D->GetLine(line); }
 
     int ScaleFactor;
@@ -118,6 +112,8 @@ private:
     // texture/fb for display capture VRAM input
     GLuint CaptureVRAMTex;
     GLuint CaptureVRAMFB;
+    GLuint CaptureSeedTex;
+    GLuint CaptureSeedFB;
 
     GLuint FPOutputTex[2];               // final output
     GLuint FPOutputFB[2];
@@ -136,6 +132,7 @@ private:
         u32 uSrcBUseVCount;
         u32 __pad0[2];
     } CaptureConfig;
+    bool CaptureLineValid[192] = {};
 
     GLuint CaptureShader;
     GLuint CaptureConfigUBO;

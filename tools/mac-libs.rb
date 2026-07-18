@@ -8,6 +8,23 @@ $build_dmg = false
 $build_dir = ""
 $bundle = ""
 $fallback_rpaths = []
+$bundled_origins = []
+
+def run_command(*command, ignore_signature_warning: false, print_output: false)
+  out, err, status = Open3.capture3(*command)
+  print out if print_output
+
+  unless err.empty?
+    if ignore_signature_warning
+      err = err.lines.reject { |line| line.match?(/code signature/i) }.join
+    end
+    warn err unless err.empty?
+  end
+
+  return out if status.success?
+
+  raise "Command failed (#{status.exitstatus}): #{command.join(" ")}"
+end
 
 def frameworks_dir
   File.join($bundle, "Contents", "Frameworks")
@@ -18,7 +35,7 @@ def executable
 end
 
 def get_rpaths(lib)
-  out, _ = Open3.capture2("otool", "-l", lib)
+  out = run_command("otool", "-l", lib)
   out = out.split("\n")
   rpaths = []
 
@@ -32,7 +49,7 @@ def get_rpaths(lib)
 end
 
 def get_load_libs(lib)
-  out, _ = Open3.capture2("otool", "-L", lib)
+  out = run_command("otool", "-L", lib)
   out.split("\n")
     .drop(1)
     .map { |it| it.strip.gsub(/ \(.*/, "") }
@@ -106,22 +123,20 @@ def install_name_tool(exec, *options)
     if it.is_a? Symbol then "-#{it.to_s}" else it end
   end
 
-  Open3.popen3("install_name_tool", *args, exec) do |stdin, stdout, stderr, thread|
-    print stdout.read
-    err = stderr.read
-    unless err.match? "code signature"
-      print err
-    end
-  end
+  run_command("install_name_tool", *args, exec, ignore_signature_warning: true)
 end
 
 def strip(lib)
-  out, _ = Open3.capture2("xcrun", "strip", "-no_code_signature_warning", "-Sx", lib)
-  print out
+  run_command("xcrun", "strip", "-no_code_signature_warning", "-Sx", lib)
 end
 
 def fixup_libs(prog, orig_path)
-  throw "fixup_libs: #{prog} doesn't exist" unless File.exist? prog
+  raise "fixup_libs: #{prog} doesn't exist" unless File.exist? prog
+
+  if File.file? orig_path
+    real_origin = File.realpath(orig_path)
+    $bundled_origins << real_origin unless $bundled_origins.include? real_origin
+  end
 
   # keep the original load command string around: install_name_tool -change
   # must be given exactly that string, not the resolved path
@@ -197,6 +212,7 @@ end
 $build_dir = ARGV[0]
 unless File.exist? $build_dir
   puts "#{$build_dir} doesn't exist"
+  exit 1
 end
 
 
@@ -252,6 +268,151 @@ def locate_plugin(dirs, plugin)
   puts "With the following plugin paths:"
   puts plugin_paths.map { |path| "- #{path}"}.join("\n")
   exit 1
+end
+
+def cmake_cache_value(name)
+  prefix = "#{name}:"
+  File.foreach(File.join($build_dir, "CMakeCache.txt")) do |line|
+    next unless line.start_with? prefix
+
+    _, value = line.chomp.split("=", 2)
+    return value
+  end
+  return nil
+end
+
+def package_license(origin, package_names, expected_content)
+  return nil if origin == nil || !File.exist?(origin)
+
+  origin = File.realpath(origin)
+  dir = File.directory?(origin) ? origin : File.dirname(origin)
+  ancestors = []
+  8.times do
+    ancestors << dir
+    parent = File.dirname(dir)
+    break if parent == dir
+    dir = parent
+  end
+
+  candidates = []
+  ancestors.each do |ancestor|
+    candidates += [
+      File.join(ancestor, "LICENSE"),
+      File.join(ancestor, "LICENSE.txt"),
+      File.join(ancestor, "LICENSE-MoltenVK.txt")
+    ]
+    package_names.each do |package|
+      candidates += [
+        File.join(ancestor, "share", package, "copyright"),
+        File.join(ancestor, "share", package, "LICENSE"),
+        File.join(ancestor, "share", package, "LICENSE.txt"),
+        File.join(ancestor, "res", "licenses", "#{package}-LICENSE.txt")
+      ]
+    end
+  end
+
+  candidates.uniq.each do |candidate|
+    next unless File.file? candidate
+    return candidate if File.read(candidate).match? expected_content
+  end
+  return nil
+end
+
+def package_notice(origin)
+  return nil if origin == nil || !File.exist?(origin)
+
+  origin = File.realpath(origin)
+  dir = File.directory?(origin) ? origin : File.dirname(origin)
+  5.times do
+    [
+      File.join(dir, "NOTICE-MoltenVK.txt"),
+      File.join(dir, "NOTICE"),
+      File.join(dir, "res", "licenses", "MoltenVK-NOTICE.txt")
+    ].each do |candidate|
+      return candidate if File.file? candidate
+    end
+    parent = File.dirname(dir)
+    break if parent == dir
+    dir = parent
+  end
+  return nil
+end
+
+def bundled_library(pattern)
+  Dir.glob(File.join(frameworks_dir, "**", "*")).find do |path|
+    File.file?(path) && File.basename(path).match?(pattern)
+  end
+end
+
+def matching_origins(pattern, cache_keys)
+  origins = $bundled_origins.select { |path| File.basename(path).match?(pattern) }
+  cache_keys.each do |key|
+    value = cmake_cache_value(key)
+    origins << value if value && File.exist?(value)
+  end
+  return origins.uniq
+end
+
+def copy_package_license(label, pattern, cache_keys, package_names,
+                         expected_content, destination)
+  return nil unless bundled_library(pattern)
+
+  origins = matching_origins(pattern, cache_keys)
+  raise "Couldn't locate the original #{label} package" if origins.empty?
+
+  origin = origins.find do |candidate|
+    package_license(candidate, package_names, expected_content)
+  end
+  unless origin
+    raise "Couldn't locate the license for bundled #{label}; checked #{origins.join(", ")}"
+  end
+  license = package_license(origin, package_names, expected_content)
+
+  destination = File.join($bundle, "Contents", "Resources",
+                          "ThirdPartyLicenses", destination)
+  FileUtils.mkdir_p(File.dirname(destination))
+  FileUtils.copy(license, destination)
+  puts "Bundled #{label} license from #{license}"
+  return origin
+end
+
+def bundle_vulkan_licenses
+  glslang_pattern = /^lib(?:glslang(?:-default-resource-limits)?|SPIRV(?:\.|[0-9]|$))/
+  spirv_tools_pattern = /^libSPIRV-Tools(?:-opt)?(?:\.|$)/
+  moltenvk_pattern = /^libMoltenVK(?:\.|$)/
+
+  copy_package_license(
+    "glslang", glslang_pattern, ["glslang_DIR"], ["glslang"],
+    /glslang proper means core GLSL parsing/i, "glslang-LICENSE.txt")
+  copy_package_license(
+    "SPIRV-Tools", spirv_tools_pattern,
+    ["SPIRV-Tools_DIR", "SPIRV-Tools-opt_DIR"],
+    ["SPIRV-Tools", "spirv-tools"],
+    /Apache License\s+Version 2\.0/m, "SPIRV-Tools-LICENSE.txt")
+  moltenvk_origin = copy_package_license(
+    "MoltenVK", moltenvk_pattern, ["MOLTENVK_LIBRARY", "CMAKE_HOME_DIRECTORY"],
+    ["MoltenVK", "molten-vk"],
+    /Apache License\s+Version 2\.0/m, "MoltenVK-LICENSE.txt")
+  return unless moltenvk_origin
+
+  licenses_dir = File.join($bundle, "Contents", "Resources", "ThirdPartyLicenses")
+  notice_destination = File.join(licenses_dir, "MoltenVK-NOTICE.txt")
+  notice = package_notice(moltenvk_origin)
+  notice ||= package_notice(cmake_cache_value("CMAKE_HOME_DIRECTORY"))
+  if notice
+    FileUtils.copy(notice, notice_destination)
+  else
+    File.write(notice_destination, <<~NOTICE)
+      melonDS MoltenVK binary modification notice
+      --------------------------------------------
+
+      When packaging melonDS.app, the Mach-O install name (LC_ID_DYLIB)
+      of libMoltenVK.dylib is changed to @rpath/libMoltenVK.dylib and its
+      code signature is replaced with an ad-hoc signature. No MoltenVK
+      source code is changed by the melonDS packaging process.
+    NOTICE
+  end
+  puts "Bundled MoltenVK modification notice"
 end
 
 FileUtils.mkdir_p(frameworks_dir)
@@ -311,8 +472,10 @@ Dir.glob("#{frameworks_dir}/**/Headers").each do |dir|
   FileUtils.rm_rf dir
 end
 
-out, _ = Open3.capture2("codesign", "-s", "-", "-f", "--deep", $bundle)
-print out
+bundle_vulkan_licenses
+
+run_command("codesign", "-s", "-", "-f", "--deep", $bundle)
+run_command("codesign", "--verify", "--deep", "--strict", $bundle)
 
 if $build_dmg
     dmg_dir = File.join($build_dir, "dmg")
@@ -320,6 +483,8 @@ if $build_dmg
     FileUtils.cp_r($bundle, dmg_dir, preserve: true)
     FileUtils.ln_s("/Applications", File.join(dmg_dir, "Applications"))
 
-    `hdiutil create -fs HFS+ -volname melonDS -srcfolder "#{dmg_dir}" -ov -format UDBZ "#{$build_dir}/melonDS.dmg"`
+    run_command("hdiutil", "create", "-fs", "HFS+", "-volname", "melonDS",
+                "-srcfolder", dmg_dir, "-ov", "-format", "UDBZ",
+                File.join($build_dir, "melonDS.dmg"), print_output: true)
     FileUtils.rm_rf(dmg_dir)
 end

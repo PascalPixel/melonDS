@@ -52,11 +52,6 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, Renderer3DType type3D)
     case Renderer3DType::Compute:
         Rend3D = std::make_unique<ComputeRenderer3D>(GPU.GPU3D, *this);
         break;
-#ifdef VKRENDERER_ENABLED
-    case Renderer3DType::ComputeVulkan:
-        Rend3D = std::make_unique<ComputeRenderer3D_Vulkan>(GPU.GPU3D, this);
-        break;
-#endif
     default:
         Rend3D = std::make_unique<GLRenderer3D>(GPU.GPU3D, *this);
         break;
@@ -166,6 +161,17 @@ bool GLRenderer::Init()
     glTexParams(GL_TEXTURE_2D_ARRAY, GL_REPEAT);
     glGenFramebuffers(1, &CaptureVRAMFB);
 
+    glGenTextures(1, &CaptureSeedTex);
+    glBindTexture(GL_TEXTURE_2D, CaptureSeedTex);
+    glTexParams(GL_TEXTURE_2D, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 128, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &CaptureSeedFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, CaptureSeedFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureSeedTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
     glGenTextures(2, FPOutputTex);
     for (int i = 0; i < 2; i++)
     {
@@ -273,6 +279,8 @@ GLRenderer::~GLRenderer()
     glDeleteFramebuffers(2, FPOutputFB);
     glDeleteTextures(1, &AuxInputTex);
     glDeleteTextures(1, &CaptureVRAMTex);
+    glDeleteTextures(1, &CaptureSeedTex);
+    glDeleteFramebuffers(1, &CaptureSeedFB);
     glDeleteTextures(2, FPOutputTex);
 
     delete[] AuxInputBuffer[0];
@@ -296,6 +304,7 @@ void GLRenderer::Reset()
 {
     memset(&FinalPassConfig, 0, sizeof(FinalPassConfig));
     memset(&CaptureConfig, 0, sizeof(CaptureConfig));
+    memset(CaptureLineValid, 0, sizeof(CaptureLineValid));
 
     AuxUsageMask = 0;
     memset(AuxInputBuffer[0], 0, 256 * 256 * sizeof(u16));
@@ -339,6 +348,8 @@ void GLRenderer::PostSavestate()
 
 void GLRenderer::SetRenderSettings(RendererSettings& settings)
 {
+    if (settings.ScaleFactor != ScaleFactor)
+        GPU.SyncRendererCaptureState();
     SetScaleFactor(settings.ScaleFactor);
 
     auto rend2d = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
@@ -352,13 +363,6 @@ void GLRenderer::SetRenderSettings(RendererSettings& settings)
         auto rend3d = dynamic_cast<ComputeRenderer3D *>(Rend3D.get());
         rend3d->SetRenderSettings(settings.ScaleFactor, settings.HiresCoordinates);
     }
-#ifdef VKRENDERER_ENABLED
-    else if (Type3D == Renderer3DType::ComputeVulkan)
-    {
-        auto rend3d = dynamic_cast<ComputeRenderer3D_Vulkan *>(Rend3D.get());
-        rend3d->SetRenderSettings(settings.ScaleFactor, settings.HiresCoordinates);
-    }
-#endif
     else
     {
         auto rend3d = dynamic_cast<GLRenderer3D *>(Rend3D.get());
@@ -473,6 +477,7 @@ void GLRenderer::DrawScanline(u32 line)
     FinalPassConfig.uScreenSwap[line] = GPU.ScreenSwap;
     FinalPassConfig.uVCount[line] = GPU.VCount;
     CaptureConfig.uVCount[line] = GPU.VCount;
+    CaptureLineValid[line] = true;
 
     u32 dispcnt = GPU.GPU2D_A.DispCnt;
     u32 dispmode = (dispcnt >> 16) & 0x3;
@@ -578,7 +583,12 @@ void GLRenderer::RenderScreen(int ystart, int yend)
     {
         u32 vrambank = (DispCntA >> 18) & 0x3;
         if (GPU.VRAMMap_LCDC & (1<<vrambank))
-            vramcap = GPU.GetCaptureBlock_LCDC(vrambank << 17);
+        {
+            u32 vramoffset = vrambank << 17;
+            if (((DispCntA >> 16) & 0x3) != 2)
+                vramoffset |= ((CaptureCnt >> 26) & 0x3) << 15;
+            vramcap = GPU.GetCaptureBlock_LCDC(vramoffset);
+        }
     }
     Aux0VRAMCap = vramcap;
 
@@ -702,6 +712,7 @@ void GLRenderer::VBlank(u32 endLine)
 void GLRenderer::VBlankEnd()
 {
     AuxUsageMask = 0;
+    memset(CaptureLineValid, 0, sizeof(CaptureLineValid));
     FrameDirty = true;
 }
 
@@ -790,6 +801,16 @@ void GLRenderer::DoCapture(int ystart, int yend)
     CaptureConfig.uSrcBColorFactor = 248.f;
 
     const bool useTrackedSrcB = useSrcB && !srcB && (Aux0VRAMCap != -1);
+    if (useTrackedSrcB && dstblock == srcBblock && yend - ystart > 1)
+    {
+        // Same-bank capture is read-before-write for each scanline. Split the
+        // band so every recursive call snapshots the bank after the previous
+        // line's write, preserving repeated or reversed VCOUNT dependencies.
+        for (int line = ystart; line < yend; line++)
+            if (CaptureLineValid[line])
+                DoCapture(line, line + 1);
+        return;
+    }
     if (useTrackedSrcB)
     {
         // hi-res VRAM
@@ -803,26 +824,36 @@ void GLRenderer::DoCapture(int ystart, int yend)
             if (dstoffset != srcBoffset)
                 Log(LogLevel::Error, "GPU_OpenGL: MISMATCHED VRAM OFFSETS ON SAME BANK!!! bank=%d src=%d dst=%d\n",
                        dstblock, srcBoffset, dstoffset);
-
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureOutput256FB[srcBblock]);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureVRAMFB);
-
-            // VCOUNT can be non-linear. Snapshot the whole source bank so
-            // every row selected by this band observes the pre-capture data.
-            glBlitFramebuffer(0, 0, 256*ScaleFactor, 256*ScaleFactor,
-                              0, 0, 256*ScaleFactor, 256*ScaleFactor,
-                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
-
-            inputB = CaptureVRAMTex;
-            layerB = 0;
         }
-        else
+
+        // Sampling any layer of an array texture while another layer at the
+        // same mip level is attached for drawing is a texture feedback loop.
+        // Snapshot every source row used by this band into a separate texture
+        // for both same- and different-bank reads.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureOutput256FB[srcBblock]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureVRAMFB);
+        bool copiedRows[256] = {};
+        for (int line = ystart; line < yend; line++)
         {
-            // if it's a different bank, we can just use it as-is
-            inputB = CaptureOutput256Tex;
-            layerB = srcBblock;
+            if (!CaptureLineValid[line])
+                continue;
+
+            const int sourceRow =
+                (srcBoffset * 64 + CaptureConfig.uVCount[line]) & 0xFF;
+            if (copiedRows[sourceRow])
+                continue;
+            copiedRows[sourceRow] = true;
+
+            const int sourceY = sourceRow * ScaleFactor;
+            glBlitFramebuffer(0, sourceY, 256*ScaleFactor,
+                              sourceY + ScaleFactor,
+                              0, sourceY, 256*ScaleFactor,
+                              sourceY + ScaleFactor,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
         }
 
+        inputB = CaptureVRAMTex;
+        layerB = 0;
         CaptureConfig.uSrcBColorFactor = 255.f;
     }
 
@@ -878,6 +909,9 @@ void GLRenderer::DoCapture(int ystart, int yend)
     // sources; the shader remaps 3D/VRAM sources through uVCount.
     for (int line = ystart; line < yend; line++)
     {
+        if (!CaptureLineValid[line])
+            continue;
+
         const int vcount = CaptureConfig.uVCount[line];
         if (vcount >= dstheight)
             continue;
@@ -904,10 +938,85 @@ void GLRenderer::DoCapture(int ystart, int yend)
 
     glBindVertexArray(CaptureVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, numvtx);
+
+    // A 32-KiB VRAM block can be interpreted as either 128x128 or 256x64.
+    // Keep both GPU representations byte-equivalent so later display and
+    // texture reads observe the most recent capture regardless of width.
+    GLint oldReadFB = 0;
+    GLint oldDrawFB = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFB);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFB);
+    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
+    if (capsize == 0)
+    {
+        bool mirroredRows[128] = {};
+        glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                          CaptureOutput128FB[(dstblock << 2) | dstoffset]);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureOutput256FB[dstblock]);
+        for (int line = ystart; line < yend; line++)
+        {
+            if (!CaptureLineValid[line])
+                continue;
+            const u32 row128 = CaptureConfig.uVCount[line];
+            if (row128 >= 128 || mirroredRows[row128])
+                continue;
+            mirroredRows[row128] = true;
+
+            const u32 row256 = dstoffset * 64 + (row128 >> 1);
+            const u32 half = row128 & 1;
+            glBlitFramebuffer(0, row128 * ScaleFactor,
+                              128 * ScaleFactor, (row128 + 1) * ScaleFactor,
+                              half * 128 * ScaleFactor, row256 * ScaleFactor,
+                              (half + 1) * 128 * ScaleFactor,
+                              (row256 + 1) * ScaleFactor,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+    else
+    {
+        bool mirroredRows[256] = {};
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureOutput256FB[dstblock]);
+        for (int line = ystart; line < yend; line++)
+        {
+            if (!CaptureLineValid[line])
+                continue;
+            const u32 vcount = CaptureConfig.uVCount[line];
+            if (vcount >= (u32)dstheight)
+                continue;
+            const u32 row256 = (dstoffset * 64 + vcount) & 0xFF;
+            if (mirroredRows[row256])
+                continue;
+            mirroredRows[row256] = true;
+
+            const u32 block = row256 >> 6;
+            const u32 compactRow = (row256 & 0x3F) * 2;
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                              CaptureOutput128FB[(dstblock << 2) | block]);
+            for (u32 half = 0; half < 2; half++)
+            {
+                glBlitFramebuffer(half * 128 * ScaleFactor,
+                                  row256 * ScaleFactor,
+                                  (half + 1) * 128 * ScaleFactor,
+                                  (row256 + 1) * ScaleFactor,
+                                  0, (compactRow + half) * ScaleFactor,
+                                  128 * ScaleFactor,
+                                  (compactRow + half + 1) * ScaleFactor,
+                                  GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            }
+        }
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldReadFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDrawFB);
+    if (scissorEnabled)
+        glEnable(GL_SCISSOR_TEST);
 }
 
 
-void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
+void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len,
+                              bool preserveContents)
 {
     auto rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
     rend2D->LayerConfigDirty = true;
@@ -915,6 +1024,58 @@ void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
     rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_B.get());
     rend2D->LayerConfigDirty = true;
     rend2D->SpriteConfigDirty = true;
+
+    if (preserveContents)
+        return;
+
+    GLint oldReadFB = 0;
+    GLint oldDrawFB = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFB);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFB);
+    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+
+    u32 pixels[128 * 128];
+    const u32 blockCount = len == 0 ? 1 : len;
+    for (u32 i = 0; i < blockCount; i++)
+    {
+        const u32 block = (start + i) & 0x3;
+        const u16* source = reinterpret_cast<const u16*>(
+            &GPU.VRAM[bank][block * 0x8000]);
+        for (u32 pixel = 0; pixel < 128 * 128; pixel++)
+        {
+            const u16 color = source[pixel];
+            pixels[pixel] = ((color & 0x001F) << 3) |
+                            ((color & 0x03E0) << 6) |
+                            ((color & 0x7C00) << 9) |
+                            ((color & 0x8000) ? 0xFF000000 : 0);
+        }
+
+        glBindTexture(GL_TEXTURE_2D, CaptureSeedTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 64,
+                        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSeedFB);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureOutput256FB[bank]);
+        glBlitFramebuffer(0, 0, 256, 64,
+                          0, block * 64 * ScaleFactor,
+                          256 * ScaleFactor, (block + 1) * 64 * ScaleFactor,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureSeedTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, 128,
+                        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureSeedFB);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                          CaptureOutput128FB[(bank << 2) | block]);
+        glBlitFramebuffer(0, 0, 128, 128,
+                          0, 0, 128 * ScaleFactor, 128 * ScaleFactor,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldReadFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDrawFB);
+    if (scissorEnabled)
+        glEnable(GL_SCISSOR_TEST);
 }
 
 void GLRenderer::DownscaleCapture(int width, int height, int layer)
@@ -971,7 +1132,7 @@ void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
         u32 pos = start;
         for (u32 i = 0; i < len;)
         {
-            u32 end = pos + len;
+            u32 end = pos + (len - i);
             if (end > 4)
                 end = 4;
 

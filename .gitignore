@@ -27,4 +27,4 @@ freebios/bios*
 freebios/build/
 
 # fetched MoltenVK release for bundling (tools/fetch-moltenvk.sh)
-external/
+/external/moltenvk/

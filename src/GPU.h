@@ -65,6 +65,7 @@ public:
     void DoSavestate(Savestate* file) noexcept;
 
     void SetRenderer(std::unique_ptr<Renderer>&& renderer) noexcept;
+    void SyncRendererCaptureState() { SyncAllVRAMCaptures(); }
     const Renderer& GetRenderer() const noexcept { return *Rend; }
     Renderer& GetRenderer() noexcept { return *Rend; }
 
@@ -706,6 +707,11 @@ public:
     u32 OAMDirty = 0;
     u32 PaletteDirty = 0;
 
+    bool IsVCountOverridePending(u32 line) const noexcept
+    {
+        return VCountOverride && NextVCount != line;
+    }
+
 private:
     void ResetVRAMCache() noexcept;
 
@@ -862,7 +868,8 @@ public:
     virtual void VBlankEnd() = 0;
     virtual void FinishFrame(u32 endLine) {}
 
-    virtual void AllocCapture(u32 bank, u32 start, u32 len) = 0;
+    virtual void AllocCapture(u32 bank, u32 start, u32 len,
+                              bool preserveContents) = 0;
     virtual void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) = 0;
 
     // a renderer may render to RAM buffers, or to something else (ie. OpenGL)
@@ -871,6 +878,7 @@ public:
     virtual void SwapBuffers() { BackBuffer ^= 1; }
 
     virtual bool NeedsShaderCompile() { return false; }
+    virtual bool ShaderCompileFailed() const { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}
 
 protected:

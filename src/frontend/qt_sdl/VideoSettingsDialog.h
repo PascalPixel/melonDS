@@ -66,7 +66,7 @@ private slots:
     void on_cbVSync_stateChanged(int state);
     void on_sbVSyncInterval_valueChanged(int val);
 
-    void on_cbxGLResolution_currentIndexChanged(int idx);
+    void on_cbxResolution_currentIndexChanged(int idx);
     void on_cbBetterPolygons_stateChanged(int state);
     void on_cbxComputeHiResCoords_stateChanged(int state);
     void on_cbDither_stateChanged(int state);
@@ -87,7 +87,7 @@ private:
     int oldVSync;
     int oldVSyncInterval;
     int oldSoftThreaded;
-    int oldGLScale;
+    int oldScaleFactor;
     int oldGLBetterPolygons;
     int oldHiresCoordinates;
     int oldDither;
@@ -95,4 +95,3 @@ private:
 };
 
 #endif // VIDEOSETTINGSDIALOG_H
-

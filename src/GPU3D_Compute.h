@@ -20,6 +20,7 @@
 #define GPU3D_COMPUTE
 
 #include <memory>
+#include <vector>
 
 #include "types.h"
 
@@ -212,6 +213,9 @@ private:
     u8 ClearBitmapDirty;
 
     GLuint Framebuffer = 0;
+    std::vector<u32> ReadbackBuffer;
+    alignas(8) u32 ReadbackLine[256] {};
+    bool ReadbackValid = false;
 
     int ScreenWidth, ScreenHeight;
     int TilesPerLine, TileLines;

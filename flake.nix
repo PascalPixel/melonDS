@@ -51,6 +51,11 @@
           (cmakeBool "USE_QT6" true)
           (cmakeBool "USE_SYSTEM_LIBSLIRP" true)
           (cmakeBool "MELONDS_EMBED_BUILD_INFO" true)
+        ] ++ optionals isDarwin [
+          # The existing Darwin derivation does not package Vulkan/glslang or
+          # MoltenVK. Keep that build valid instead of inheriting the normal
+          # Apple default until those dependencies are supplied here.
+          (cmakeBool "ENABLE_VKRENDERER" false)
         ];
 
         env.MELONDS_GIT_HASH = revision;

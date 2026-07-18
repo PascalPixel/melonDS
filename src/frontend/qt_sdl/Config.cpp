@@ -54,7 +54,7 @@ DefaultList<int> DefaultInts =
     {"Instance*.Window*.Height", 384},
     {"Screen.VSyncInterval", 1},
     {"3D.Renderer", renderer3D_Software},
-    {"3D.GL.ScaleFactor", 1},
+    {"3D.ScaleFactor", 1},
 #ifdef JIT_ENABLED
     {"JIT.MaxBlockSize", 32},
 #endif
@@ -79,7 +79,7 @@ RangeList IntRanges =
     {"Emu.ConsoleType", {0, 1}},
     {"3D.Renderer", {0, renderer3D_Max-1}},
     {"Screen.VSyncInterval", {1, 20}},
-    {"3D.GL.ScaleFactor", {1, 16}},
+    {"3D.ScaleFactor", {1, 16}},
     {"Audio.Interpolation", {0, 4}},
     {"Instance*.Audio.Volume", {0, 256}},
     {"Mic.InputType", {0, micInputType_MAX-1}},
@@ -97,9 +97,9 @@ DefaultList<bool> DefaultBools =
 {
     {"Screen.Filter", true},
     {"3D.Soft.Threaded", true},
-    {"3D.GL.HiresCoordinates", true},
-    {"3D.GL.Dither", false},
-    {"3D.GL.TexFilter", false},
+    {"3D.HiresCoordinates", true},
+    {"3D.Vulkan.Dither", false},
+    {"3D.Vulkan.TexFilter", false},
     {"LimitFPS", true},
     {"Instance*.Window*.ShowOSD", true},
     {"Emu.DirectBoot", true},
@@ -217,9 +217,9 @@ LegacyEntry LegacyFile[] =
     {"3DRenderer", 0, "3D.Renderer", false},
     {"Threaded3D", 1, "3D.Soft.Threaded", false},
 
-    {"GL_ScaleFactor", 0, "3D.GL.ScaleFactor", false},
+    {"GL_ScaleFactor", 0, "3D.ScaleFactor", false},
     {"GL_BetterPolygons", 1, "3D.GL.BetterPolygons", false},
-    {"GL_HiresCoordinates", 1, "3D.GL.HiresCoordinates", false},
+    {"GL_HiresCoordinates", 1, "3D.HiresCoordinates", false},
 
     {"LimitFPS", 1, "LimitFPS", false},
     {"MaxFPS", 0, "MaxFPS", false},
@@ -784,6 +784,63 @@ bool LoadLegacy()
     return true;
 }
 
+enum ConfigSettingType
+{
+    configSetting_Integer,
+    configSetting_Boolean,
+};
+
+static void MigrateSetting(const toml::table& source, const char* sourceKey,
+                           toml::table& destination, const char* destinationKey,
+                           ConfigSettingType type)
+{
+    auto hasExpectedType = [type](const toml::value& setting)
+    {
+        return type == configSetting_Integer ? setting.is_integer() : setting.is_boolean();
+    };
+
+    auto destinationSetting = destination.find(destinationKey);
+    if (destinationSetting != destination.end() && hasExpectedType(destinationSetting->second))
+        return;
+
+    auto setting = source.find(sourceKey);
+    if (setting != source.end() && hasExpectedType(setting->second))
+        destination[destinationKey] = setting->second;
+}
+
+static void MigrateRendererSettings()
+{
+    if (!RootTable.is_table())
+        return;
+
+    toml::table& root = RootTable.as_table();
+    auto renderer = root.find("3D");
+    if (renderer == root.end() || !renderer->second.is_table())
+        return;
+
+    toml::table& rendererSettings = renderer->second.as_table();
+    auto gl = rendererSettings.find("GL");
+    if (gl == rendererSettings.end() || !gl->second.is_table())
+        return;
+
+    toml::table& glSettings = gl->second.as_table();
+    MigrateSetting(glSettings, "ScaleFactor", rendererSettings, "ScaleFactor", configSetting_Integer);
+    MigrateSetting(glSettings, "HiresCoordinates", rendererSettings, "HiresCoordinates", configSetting_Boolean);
+
+    if (glSettings.count("Dither") == 0 && glSettings.count("TexFilter") == 0)
+        return;
+
+    auto vulkan = rendererSettings.find("Vulkan");
+    if (vulkan == rendererSettings.end())
+        vulkan = rendererSettings.emplace("Vulkan", toml::table()).first;
+    if (!vulkan->second.is_table())
+        return;
+
+    toml::table& vulkanSettings = vulkan->second.as_table();
+    MigrateSetting(glSettings, "Dither", vulkanSettings, "Dither", configSetting_Boolean);
+    MigrateSetting(glSettings, "TexFilter", vulkanSettings, "TexFilter", configSetting_Boolean);
+}
+
 bool Load()
 {
     auto cfgpath = Platform::GetLocalFilePath(kConfigFile);
@@ -794,17 +851,23 @@ bool Load()
     RootTable = toml::value();
 
     if (!Platform::FileExists(cfgpath))
-        return LoadLegacy();
-
-    try
     {
-        RootTable = toml::parse(std::filesystem::u8path(cfgpath));
+        if (!LoadLegacy())
+            return false;
     }
-    catch (toml::syntax_error& err)
+    else
     {
-        //RootTable = toml::table();
+        try
+        {
+            RootTable = toml::parse(std::filesystem::u8path(cfgpath));
+        }
+        catch (toml::syntax_error& err)
+        {
+            //RootTable = toml::table();
+        }
     }
 
+    MigrateRendererSettings();
     return true;
 }
 

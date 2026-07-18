@@ -16,7 +16,8 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-#pragma once
+#ifndef GPU2D_VULKAN_H
+#define GPU2D_VULKAN_H
 
 #include <array>
 #include <map>
@@ -69,7 +70,7 @@ public:
 
     // call only while this renderer's command buffers are not executing
     // (device idle); recreates the scale-dependent images
-    void SetScaleFactor(int scale);
+    bool SetScaleFactor(int scale);
 
     // resources owned by the (future) parent VulkanRenderer.
     // all views must be in SHADER_READ_ONLY_OPTIMAL whenever this
@@ -92,6 +93,7 @@ public:
     // command buffer that subsequent DrawScanline/DrawSprites/VBlank
     // work is recorded into; provided per band by the parent
     void SetCommandBuffer(VkCommandBuffer cmd) { CurCmd = cmd; }
+    bool BeginFrame(int frameSlot);
 
     // mirror of GLRenderer::NeedPartialRender (forces compositing of the
     // current band even when no 2D state changed)
@@ -228,6 +230,10 @@ private:
     std::vector<u32> SoftUploadBuffer;
     u32 SoftFlushedLine = 0;
     bool UseSoftware2D = false;
+    u32 SoftwareFallbackFrames = 0;
+    bool SoftwareFallbackForVCount = false;
+    u32 SoftSpriteLine = 0;
+    bool SoftSpritePrepared = false;
 
     u32 CompositeBands = 0;
     bool SawVCountMismatch = false;
@@ -235,11 +241,16 @@ private:
     VK::Context::Image DummyTex;                    // 1x1 RGBA8 stand-ins for unset
     VK::Context::Image DummyTexArray;               // shared resources / unassigned layers
 
-    // descriptor sets, one per combination of variable bindings
-    // (VRAM/palette pair, BG layer aliases + wrap modes, 3D layer swap),
-    // cached for the lifetime of the current scale factor / shared views
-    VkDescriptorPool DescPool = VK_NULL_HANDLE;
-    std::map<std::array<uintptr_t, 10>, VkDescriptorSet> DescCache;
+    // Descriptor sets are cached per in-flight parent frame. An arena is
+    // reset only after the parent has waited for that slot's fence, bounding
+    // descriptor growth without invalidating sets still in use by the GPU.
+    struct sDescriptorArena
+    {
+        std::vector<VkDescriptorPool> Pools;
+        std::map<std::array<uintptr_t, 10>, VkDescriptorSet> Cache;
+    };
+    sDescriptorArena DescriptorArenas[2];
+    int DescriptorArena = 0;
 
     // std140 compliant config struct for the layer shader
     struct sLayerConfig
@@ -343,14 +354,15 @@ private:
     bool CompilePipelineShader(VkShaderModule& out, VK::Context::ShaderStage stage,
                                const std::string& source, const char* name);
     bool CreatePalView(const VK::Context::Image& img, VkImageView& out);
+    bool AddDescriptorPool(sDescriptorArena& arena);
     void DestroyScaleDependentResources();
     void InvalidateDescriptorCache();
 
     u32 RingAlloc(sRingBuffer& ring, u32 size);
     bool StagingAlloc(u32 size, sRingBuffer*& page, u32& offset);
     void RetryStagingUploads();
-    void PushConfig(sConfigRing& ring, const void* data, u32 size);
-    void FlushMappedBuffers();
+    bool PushConfig(sConfigRing& ring, const void* data, u32 size);
+    bool FlushMappedBuffers();
 
     VkDescriptorSet GetDescriptorSet(VkImageView vram, VkImageView pal,
                                      const VkImageView* bgViews, const VkSampler* bgSamplers);
@@ -376,15 +388,17 @@ private:
     bool IsScreenOn();
     void DrawSoftwareLine(u32 line);
     void FlushSoftwareLines(u32 endLine);
+    void SwitchToSoftware(u32 line);
+    void SwitchToHardware(u32 line);
     void Flush(u32 endLine);
     void FinishFrame(u32 endLine);
 
     void UpdateAndRender(int line);
 
     void UpdateScanlineConfig(int line);
-    void UpdateLayerConfig();
-    void UpdateOAM(int ystart, int yend);
-    void UpdateCompositorConfig();
+    bool UpdateLayerConfig();
+    bool UpdateOAM(int ystart, int yend);
+    bool UpdateCompositorConfig();
 
     void PrerenderSprites();
     void PrerenderLayer(int layer);
@@ -396,3 +410,5 @@ private:
 };
 
 }
+
+#endif // GPU2D_VULKAN_H

@@ -42,6 +42,19 @@
 		{ "name": "dirent", "platform": "windows" }
 	],
 	"features": {
+		"vulkan": {
+			"description": "Build the Vulkan renderer on non-macOS platforms.",
+			"dependencies": [
+				{
+					"name": "vulkan-headers",
+					"platform": "!osx"
+				},
+				{
+					"name": "glslang",
+					"platform": "!osx"
+				}
+			]
+		},
 		"qt6": {
 			"description": "Use Qt 6 for the frontend.",
 			"dependencies": [

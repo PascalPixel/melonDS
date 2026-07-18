@@ -83,6 +83,8 @@ bool IsRuntimeAvailable();
     x(vkBindBufferMemory) \
     x(vkMapMemory) \
     x(vkUnmapMemory) \
+    x(vkFlushMappedMemoryRanges) \
+    x(vkInvalidateMappedMemoryRanges) \
     x(vkCreateImage) \
     x(vkDestroyImage) \
     x(vkGetImageMemoryRequirements) \
@@ -167,6 +169,8 @@ public:
         VkDeviceMemory Mem = VK_NULL_HANDLE;
         void* Map = nullptr;
         VkDeviceSize Size = 0;
+        VkDeviceSize AllocationSize = 0;
+        VkMemoryPropertyFlags MemoryFlags = 0;
     };
 
     struct Image
@@ -181,6 +185,10 @@ public:
 
     bool CreateBuffer(Buffer& buf, VkDeviceSize size, VkBufferUsageFlags usage, bool hostVisible);
     void DestroyBuffer(Buffer& buf);
+    bool FlushBuffer(const Buffer& buf, VkDeviceSize offset = 0,
+                     VkDeviceSize size = VK_WHOLE_SIZE);
+    bool InvalidateBuffer(const Buffer& buf, VkDeviceSize offset = 0,
+                          VkDeviceSize size = VK_WHOLE_SIZE);
 
     bool CreateImage(Image& img, VkFormat format, u32 width, u32 height, u32 layers,
                      VkImageUsageFlags usage, bool array2D);
@@ -193,10 +201,14 @@ public:
 
     // uploads data into one layer of an image and leaves it in SHADER_READ_ONLY_OPTIMAL
     // (synchronous; intended for cache-miss texture uploads)
-    void UploadImageLayer(Image& img, const void* data, u32 width, u32 height, u32 layer, u32 bytesPerPixel);
+    bool UploadImageLayer(Image& img, const void* data, u32 width, u32 height,
+                          u32 layer, u32 bytesPerPixel,
+                          VkPipelineStageFlags consumerStages =
+                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     VkCommandBuffer BeginOneShot();
-    void EndOneShot(VkCommandBuffer cmd); // submits and waits
+    bool EndOneShot(VkCommandBuffer cmd); // submits and waits
 
     // compiles Vulkan-flavoured GLSL to SPIR-V and wraps it in a shader module
     enum class ShaderStage { Vertex, Fragment, Compute };
@@ -243,7 +255,6 @@ public:
     u32 FindMemoryType(u32 typeBits, VkMemoryPropertyFlags wanted);
 
 private:
-    void* LibVulkan = nullptr;
     bool LoadLibrary();
     bool OwnsGlslang = false;
 };

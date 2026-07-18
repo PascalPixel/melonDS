@@ -163,7 +163,8 @@ public:
         return false;
     }
 
-    void GetTexture(u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper)
+    bool GetTexture(u32 texParam, u32 palBase, TexHandleT& textureHandle,
+                    u32& layer, u32*& helper)
     {
         // remove sampling and texcoord gen params
         texParam &= ~0xC00F0000;
@@ -187,7 +188,7 @@ public:
             textureHandle = it->second.Texture.TextureID;
             layer = it->second.Texture.Layer;
             helper = &it->second.LastVariant;
-            return;
+            return true;
         }
 
         u32 widthLog2 = (texParam >> 20) & 0x7;
@@ -282,6 +283,15 @@ public:
             // allocate new array texture
             //printf("allocating new layer set for %d %d %d %d\n", width, height, texArrays.size()-1, array.ImageDescriptor);
             array = TexLoader.GenerateTexture(width, height, layers);
+            if (!TexLoader.IsValid(array))
+            {
+                TexLoader.DeleteTexture(array);
+                texArrays.pop_back();
+                textureHandle = TexHandleT{};
+                layer = 0;
+                helper = nullptr;
+                return false;
+            }
 
             for (u32 i = 0; i < layers; i++)
             {
@@ -294,12 +304,22 @@ public:
 
         entry.Texture = storagePlace;
 
-        TexLoader.UploadTexture(storagePlace.TextureID, width, height, storagePlace.Layer, DecodingBuffer);
+        if (!TexLoader.UploadTexture(storagePlace.TextureID, width, height,
+                                     storagePlace.Layer, DecodingBuffer))
+        {
+            if (TexLoader.IsValid(storagePlace.TextureID))
+                freeTextures.push_back(storagePlace);
+            textureHandle = TexHandleT{};
+            layer = 0;
+            helper = nullptr;
+            return false;
+        }
         //printf("using storage place %d %d | %d %d (%d)\n", width, height, storagePlace.TexArrayIdx, storagePlace.LayerIdx, array.ImageDescriptor);
 
         textureHandle = storagePlace.TextureID;
         layer = storagePlace.Layer;
         helper = &Cache.emplace(std::make_pair(key, entry)).first->second.LastVariant;
+        return true;
     }
 
     void Reset()

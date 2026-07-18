@@ -861,6 +861,21 @@ void EmuThread::enableCheats(bool enable)
 void EmuThread::updateRenderer()
 {
     auto nds = emuInstance->nds;
+    auto& cfg = emuInstance->getGlobalConfig();
+
+#ifdef __APPLE__
+    // OpenGL compute requires 4.3 and cannot run on macOS. Persist the
+    // migration so the settings dialog and the active renderer agree.
+    if (videoRenderer == renderer3D_OpenGLCompute)
+    {
+#ifdef VKRENDERER_ENABLED
+        videoRenderer = renderer3D_Vulkan;
+#else
+        videoRenderer = renderer3D_Software;
+#endif
+        cfg.SetInt("3D.Renderer", videoRenderer);
+    }
+#endif
 
     if (videoRenderer != lastVideoRenderer)
     {
@@ -873,20 +888,10 @@ void EmuThread::updateRenderer()
                 nds->SetRenderer(std::make_unique<GLRenderer>(*nds, Renderer3DType::OpenGL));
                 break;
             case renderer3D_OpenGLCompute:
-#if defined(__APPLE__) && defined(VKRENDERER_ENABLED)
-                // macOS can't provide the OpenGL 4.3 context this renderer needs
-                // (e.g. a config carried over from another platform);
-                // transparently substitute the Vulkan renderer
-                nds->SetRenderer(std::make_unique<VulkanRenderer>(*nds));
-#else
                 nds->SetRenderer(std::make_unique<GLRenderer>(*nds, Renderer3DType::Compute));
-#endif
                 break;
 #ifdef VKRENDERER_ENABLED
-            case renderer3D_VulkanCompute:
-                nds->SetRenderer(std::make_unique<GLRenderer>(*nds, Renderer3DType::ComputeVulkan));
-                break;
-            case renderer3D_VulkanFull:
+            case renderer3D_Vulkan:
                 nds->SetRenderer(std::make_unique<VulkanRenderer>(*nds));
                 break;
 #endif
@@ -895,17 +900,19 @@ void EmuThread::updateRenderer()
     }
     lastVideoRenderer = videoRenderer;
 
-    auto& cfg = emuInstance->getGlobalConfig();
     melonDS::RendererSettings settings = {
-        .ScaleFactor = cfg.GetInt("3D.GL.ScaleFactor"),
+        .ScaleFactor = cfg.GetInt("3D.ScaleFactor"),
         .Threaded = cfg.GetBool("3D.Soft.Threaded"),
-        .HiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates"),
+        .HiresCoordinates = cfg.GetBool("3D.HiresCoordinates"),
         .BetterPolygons = cfg.GetBool("3D.GL.BetterPolygons"),
-        .Dither = cfg.GetBool("3D.GL.Dither"),
-        .TexFilter = cfg.GetBool("3D.GL.TexFilter")
+        .Dither = cfg.GetBool("3D.Vulkan.Dither"),
+        .TexFilter = cfg.GetBool("3D.Vulkan.TexFilter")
     };
 
+    const int requestedScaleFactor = settings.ScaleFactor;
     nds->GetRenderer().SetRenderSettings(settings);
+    if (settings.ScaleFactor != requestedScaleFactor)
+        cfg.SetInt("3D.ScaleFactor", settings.ScaleFactor);
 }
 
 void EmuThread::compileShaders()
@@ -921,5 +928,20 @@ void EmuThread::compileShaders()
     }
     while (renderer.NeedsShaderCompile() &&
              (SDL_GetPerformanceCounter() - startTime) * perfCountsSec < 1.0 / 6.0);
+
+    if (renderer.ShaderCompileFailed())
+    {
+        Platform::Log(Platform::LogLevel::Error,
+                      "Hardware renderer shader compilation failed; falling back to software rendering.\n");
+
+        auto& cfg = emuInstance->getGlobalConfig();
+        cfg.SetInt("3D.Renderer", renderer3D_Software);
+        videoRenderer = renderer3D_Software;
+        updateRenderer();
+
+        emuInstance->osdAddMessage(0, "Shader compilation failed; switched to software renderer");
+        return;
+    }
+
     emuInstance->osdAddMessage(0, "Compiling shader %d/%d", currentShader+1, shadersCount);
 }

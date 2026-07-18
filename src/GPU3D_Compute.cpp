@@ -318,6 +318,7 @@ void ComputeRenderer3D::Reset()
 {
     Texcache.Reset();
     ClearBitmapDirty = 0x3;
+    ReadbackValid = false;
 }
 
 void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordinates)
@@ -382,6 +383,8 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     glGenTextures(1, &Framebuffer);
     glBindTexture(GL_TEXTURE_2D, Framebuffer);
     glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, ScreenWidth, ScreenHeight);
+    ReadbackBuffer.resize((size_t)ScreenWidth * ScreenHeight);
+    ReadbackValid = false;
 
     Parent.OutputTex3D = Framebuffer;
 
@@ -638,6 +641,7 @@ void ComputeRenderer3D::RenderFrame()
     {
         return;
     }
+    ReadbackValid = false;
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -783,7 +787,13 @@ void ComputeRenderer3D::RenderFrame()
                 }
                 else
                 {
-                    Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant);
+                    if (!Texcache.GetTexture(polygon->TexParam, polygon->TexPalette,
+                                             variant.Texture, prevTexLayer,
+                                             textureLastVariant))
+                    {
+                        GPU3D.AbortFrame = true;
+                        return;
+                    }
                     variant.CaptureYOffset = -1;
                 }
 
@@ -1272,7 +1282,47 @@ void ComputeRenderer3D::RestartFrame()
 
 u32* ComputeRenderer3D::GetLine(int line)
 {
-    return nullptr;
+    if (GPU3D.AbortFrame)
+    {
+        memset(ReadbackLine, 0, sizeof(ReadbackLine));
+        return ReadbackLine;
+    }
+
+    if (!ReadbackValid)
+    {
+        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+        glBindTexture(GL_TEXTURE_2D, Framebuffer);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                      ReadbackBuffer.data());
+        ReadbackValid = true;
+    }
+
+    const u16 xpos = GPU3D.GetRenderXPos();
+    const u32 sourceY = line * ScaleFactor;
+    for (int x = 0; x < 256; x++)
+    {
+        int sourceX;
+        if (xpos & 0x100)
+            sourceX = x - (512 - xpos);
+        else
+            sourceX = x + xpos;
+
+        if (sourceX < 0 || sourceX >= 256)
+        {
+            ReadbackLine[x] = 0;
+            continue;
+        }
+
+        const u32 color = ReadbackBuffer[(sourceY * ScreenWidth) +
+                                         (sourceX * ScaleFactor)];
+        const u32 r = ((color & 0xFF) * 63 + 127) / 255;
+        const u32 g = (((color >> 8) & 0xFF) * 63 + 127) / 255;
+        const u32 b = (((color >> 16) & 0xFF) * 63 + 127) / 255;
+        const u32 a = (((color >> 24) & 0xFF) * 31 + 127) / 255;
+        ReadbackLine[x] = r | (g << 8) | (b << 16) | (a << 24);
+    }
+
+    return ReadbackLine;
 }
 
 }

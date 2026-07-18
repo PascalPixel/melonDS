@@ -120,6 +120,10 @@ private:
     std::vector<u32> SoftUploadBuffer;
     u32 SoftFlushedLine = 0;
     bool UseSoftware2D = false;
+    u32 SoftwareFallbackFrames = 0;
+    bool SoftwareFallbackForVCount = false;
+    u32 SoftSpriteLine = 0;
+    bool SoftSpritePrepared = false;
 
     u32 CompositeBands = 0;
     bool SawVCountMismatch = false;
@@ -224,7 +228,9 @@ private:
     bool IsScreenOn();
     void DrawSoftwareLine(u32 line);
     void FlushSoftwareLines(u32 endLine);
+    void SwitchToSoftware(u32 line);
     void SwitchToHardware(u32 line);
+    void InvalidateHardwareState();
     void Flush(u32 endLine);
     void FinishFrame(u32 endLine);
 

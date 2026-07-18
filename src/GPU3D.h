@@ -338,6 +338,7 @@ public:
     virtual u32* GetLine(int line) = 0;
 
     virtual bool NeedsShaderCompile() { return false; }
+    virtual bool ShaderCompileFailed() const { return false; }
     virtual void ShaderCompileStep(int& current, int& count) {}
 
 protected:

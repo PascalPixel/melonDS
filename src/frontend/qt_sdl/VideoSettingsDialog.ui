@@ -52,7 +52,7 @@
       <item>
        <widget class="QRadioButton" name="rb3DCompute">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;A compute-shader renderer with the accuracy of software and the speed of the GPU. Requires OpenGL 4.3.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;A GPU renderer based on compute shaders. Requires OpenGL 4.3.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
         </property>
         <property name="text">
          <string>OpenGL (Compute shader)</string>
@@ -60,22 +60,12 @@
        </widget>
       </item>
       <item>
-       <widget class="QRadioButton" name="rb3DVulkanFull">
+       <widget class="QRadioButton" name="rb3DVulkan">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;A compute-shader renderer built on Vulkan. Same speed and accuracy as the OpenGL compute renderer, and it works where OpenGL 4.3 is unavailable, such as macOS.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;A hardware renderer using Vulkan for 2D and 3D rendering. It is available on macOS through MoltenVK.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
         </property>
         <property name="text">
          <string>Vulkan</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QRadioButton" name="rb3DVulkan">
-        <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The Vulkan compute renderer runs the 3D engine on Vulkan and composites the 2D layers with OpenGL. Superseded by the full Vulkan renderer; kept only for compatibility with older settings.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-        </property>
-        <property name="text">
-         <string>Vulkan (3D compute, GL 2D)</string>
         </property>
        </widget>
       </item>
@@ -96,7 +86,7 @@
        </widget>
       </item>
       <item>
-       <widget class="QComboBox" name="cbxGLResolution">
+       <widget class="QComboBox" name="cbxResolution">
         <property name="whatsThis">
          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The resolution at which the 3D graphics are rendered. Higher resolutions look sharper when the window is enlarged, but may cause glitches.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
         </property>
@@ -253,11 +243,13 @@
   <tabstop>rb3DSoftware</tabstop>
   <tabstop>rb3DOpenGL</tabstop>
   <tabstop>rb3DCompute</tabstop>
-  <tabstop>rb3DVulkanFull</tabstop>
-  <tabstop>cbxGLResolution</tabstop>
+  <tabstop>rb3DVulkan</tabstop>
+  <tabstop>cbxResolution</tabstop>
   <tabstop>cbxComputeHiResCoords</tabstop>
   <tabstop>cbBetterPolygons</tabstop>
   <tabstop>cbSoftwareThreaded</tabstop>
+  <tabstop>cbDither</tabstop>
+  <tabstop>cbTexFilter</tabstop>
   <tabstop>cbGLDisplay</tabstop>
   <tabstop>cbVSync</tabstop>
   <tabstop>sbVSyncInterval</tabstop>

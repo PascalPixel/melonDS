@@ -25,6 +25,11 @@
    cmake --build build -j$(nproc --all)
    ```
 
+The Vulkan renderer is optional outside macOS. Install the Vulkan headers and
+glslang development package for your distribution, then configure with
+`-DENABLE_VKRENDERER=ON`. With manifest-mode vcpkg, also enable its `vulkan`
+feature.
+
 ## Windows
 1. Install [MSYS2](https://www.msys2.org/)
 2. Open the MSYS2 terminal from the Start menu:
@@ -54,10 +59,18 @@
 
 If everything went well, melonDS should now be in the `build` folder. For dynamic builds, you may need to run melonDS from the MSYS2 terminal in order for it to find the required DLLs.
 
+The Vulkan renderer is not enabled by default on Windows. It requires Vulkan
+headers and glslang at build time, an installed Vulkan loader and driver at
+runtime, and the OpenGL renderer for presentation. The MSYS2 package command
+above only covers the default renderer. A manifest-mode vcpkg build can opt in
+with the `vulkan` feature and `-DENABLE_VKRENDERER=ON`; other Windows toolchains
+must provide equivalent Vulkan headers and glslang libraries themselves.
+
 ## macOS
 1. Install the [Homebrew Package Manager](https://brew.sh)
-2. Install dependencies: `brew install git pkg-config cmake sdl2 qt@6 libarchive enet zstd faad2`
-   * For the Vulkan (compute shader) renderer, additionally: `brew install vulkan-headers vulkan-loader molten-vk glslang`
+2. Install dependencies: `brew install git pkg-config cmake sdl2 qt@6 libarchive enet zstd faad2 vulkan-headers vulkan-loader molten-vk glslang`
+   * To build without the Vulkan renderer, omit the four Vulkan packages and
+     configure with `-DENABLE_VKRENDERER=OFF`.
 3. Download the melonDS repository and prepare:
    ```zsh
    git clone https://github.com/melonDS-emu/melonDS
@@ -71,10 +84,22 @@ If everything went well, melonDS should now be in the `build` folder. For dynami
 If everything went well, melonDS.app should now be in the `build` directory.
 
 ### Self-contained app bundle
-If you want an app bundle that can be distributed to other computers without needing to install dependencies through Homebrew, you can additionally run `
-../tools/mac-libs.rb .` after the build is completed, or add `-DMACOS_BUNDLE_LIBS=ON` to the first CMake command.
+If you want an app bundle that can be distributed to other computers without
+needing to install dependencies through Homebrew, you can additionally run
+`../tools/mac-libs.rb .` after the build is completed, or add
+`-DMACOS_BUNDLE_LIBS=ON` to the first CMake command.
 
 When the Vulkan renderer is enabled, `libMoltenVK.dylib` is copied into the bundle automatically if it can be found (from `external/moltenvk` as staged by `tools/fetch-moltenvk.sh`, a Vulkan SDK, or Homebrew), so the Vulkan renderer keeps working on systems without a Vulkan runtime installed.
+
+`tools/fetch-moltenvk.sh` verifies the official release archive checksum and
+stages its Apache-2.0 license and a binary-modification notice alongside the
+library. Self-contained bundles produced by `tools/mac-libs.rb` put the
+licenses for MoltenVK, glslang, and SPIRV-Tools in
+`Contents/Resources/ThirdPartyLicenses`. The notice records that melonDS
+packaging rewrites MoltenVK's Mach-O install name and replaces its code
+signature; it does not alter MoltenVK source code. SPIRV-Headers is a build-time
+header dependency and is not copied into the app bundle. The full Vulkan
+dependency inventory is in `res/licenses/README.md`.
 
 ## Nix (macOS/Linux)
 
@@ -82,3 +107,8 @@ melonDS provides a Nix flake with support for both macOS and Linux. The [Nix pac
 
 * To run melonDS, just type `nix run github:melonDS-emu/melonDS`.
 * To get a shell for development, clone the melonDS repository and type `nix develop` in its directory.
+
+The current Darwin Nix derivation explicitly disables the Vulkan renderer: it
+does not yet package glslang or MoltenVK. Use the macOS CMake/Homebrew build
+above for a Vulkan-enabled app, or extend the derivation with those dependencies
+before enabling `ENABLE_VKRENDERER`.

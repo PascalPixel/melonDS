@@ -414,6 +414,10 @@ void GLRenderer2D::Reset()
     memset(SoftFrameBuffer, 0, sizeof(SoftFrameBuffer));
     SoftFlushedLine = 0;
     UseSoftware2D = false;
+    SoftwareFallbackFrames = 0;
+    SoftwareFallbackForVCount = false;
+    SoftSpriteLine = 0;
+    SoftSpritePrepared = false;
     CompositeBands = 0;
     SawVCountMismatch = false;
 
@@ -919,13 +923,60 @@ void GLRenderer2D::SwitchToHardware(u32 line)
 {
     FlushSoftwareLines(line);
     Reset();
+    InvalidateHardwareState();
     LastLine = line;
     LastSpriteLine = line;
+}
+
+void GLRenderer2D::SwitchToSoftware(u32 line)
+{
+    Flush(line);
+    if (!SoftSpritePrepared || SoftSpriteLine != line)
+    {
+        SoftFallback->Reset();
+        SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
+    }
+    SoftFlushedLine = line;
+    UseSoftware2D = true;
+    SoftwareFallbackFrames = 0;
+    SoftwareFallbackForVCount = true;
+}
+
+void GLRenderer2D::InvalidateHardwareState()
+{
+    // The software renderer keeps the shared flattened VRAM coherent and in
+    // doing so consumes the global dirty trackers. Force one complete upload
+    // when returning to OpenGL so its private textures cannot resume stale.
+    if (GPU2D.Num == 0)
+    {
+        GPU.VRAMDirty_ABG.Reset();
+        GPU.VRAMDirty_AOBJ.Reset();
+        GPU.VRAMDirty_ABGExtPal.Reset();
+        GPU.VRAMDirty_AOBJExtPal.Reset();
+    }
+    else
+    {
+        GPU.VRAMDirty_BBG.Reset();
+        GPU.VRAMDirty_BOBJ.Reset();
+        GPU.VRAMDirty_BBGExtPal.Reset();
+        GPU.VRAMDirty_BOBJExtPal.Reset();
+    }
+
+    GPU.PaletteDirty |= 0x3 << (GPU2D.Num * 2);
+    GPU.OAMDirty |= 1 << GPU2D.Num;
+    LayerConfigDirty = true;
+    SpriteConfigDirty = true;
+    SpriteDirty = true;
 }
 
 void GLRenderer2D::DrawScanline(u32 line)
 {
     SawVCountMismatch |= line != GPU.VCount;
+
+    if (!UseSoftware2D && line != GPU.VCount)
+        SwitchToSoftware(line);
 
     if (UseSoftware2D)
         DrawSoftwareLine(line);
@@ -952,7 +1003,12 @@ void GLRenderer2D::FinishFrame(u32 endLine)
     Flush(endLine);
 
     if (UseSoftware2D)
+    {
         SoftFlushedLine = 0;
+        if ((SoftwareFallbackForVCount && !SawVCountMismatch) ||
+            (!SoftwareFallbackForVCount && ++SoftwareFallbackFrames >= 120))
+            SwitchToHardware(0);
+    }
     else
     {
 
@@ -964,11 +1020,12 @@ void GLRenderer2D::FinishFrame(u32 endLine)
         // already-rendered 3D output is read back once and composited with it.
         const bool supportsFallback = GPU2D.Num == 1 || !(DispCnt & (1 << 3)) ||
                                       Parent.CanReadback3D();
-        if (supportsFallback && ScaleFactor <= 4 &&
-            (CompositeBands > 64 || SawVCountMismatch))
+        if (supportsFallback && ScaleFactor <= 4 && CompositeBands > 64)
         {
             SoftFallback->Reset();
             UseSoftware2D = true;
+            SoftwareFallbackFrames = 0;
+            SoftwareFallbackForVCount = false;
         }
     }
 
@@ -2009,6 +2066,8 @@ void GLRenderer2D::DrawSprites(u32 line)
     if (UseSoftware2D)
     {
         SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
         return;
     }
 
@@ -2097,6 +2156,16 @@ void GLRenderer2D::DrawSprites(u32 line)
     // so it will be able to do the actual sprite rendering
     if (dirty)
         SpriteDirty = true;
+
+    // A VCOUNT write is applied after this one-line-ahead sprite evaluation.
+    // Prepare the software copy now, from the same latched state, so an
+    // immediate fallback on the next scanline does not reconstruct it late.
+    if (GPU.IsVCountOverridePending(line))
+    {
+        SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
+    }
 }
 
 void GLRenderer2D::UploadTexture2D(GLint x, GLint y, GLsizei width, GLsizei height,

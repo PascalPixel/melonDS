@@ -18,26 +18,34 @@
 
 #include "GPU3D_TexcacheVulkan.h"
 
+#include <new>
+
 namespace melonDS
 {
 
 VulkanTexArray* TexcacheVulkanLoader::GenerateTexture(u32 width, u32 height, u32 layers) const
 {
-    VulkanTexArray* tex = new VulkanTexArray();
+    VulkanTexArray* tex = new (std::nothrow) VulkanTexArray();
+    if (!tex)
+        return nullptr;
     if (!Ctx->CreateImage(tex->Image, VK_FORMAT_R8G8B8A8_UINT, width, height, layers,
                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, true))
-    {
-        delete tex;
-        return nullptr;
-    }
+        return tex;
+    tex->Valid = true;
     return tex;
 }
 
-void TexcacheVulkanLoader::UploadTexture(VulkanTexArray* handle, u32 width, u32 height, u32 layer, void* data) const
+bool TexcacheVulkanLoader::UploadTexture(VulkanTexArray* handle, u32 width, u32 height,
+                                         u32 layer, void* data) const
 {
-    if (!handle)
-        return;
-    Ctx->UploadImageLayer(handle->Image, data, width, height, layer, 4);
+    if (!handle || !handle->Valid)
+        return false;
+    if (!Ctx->UploadImageLayer(handle->Image, data, width, height, layer, 4))
+    {
+        handle->Valid = false;
+        return false;
+    }
+    return true;
 }
 
 void TexcacheVulkanLoader::DeleteTexture(VulkanTexArray* handle) const

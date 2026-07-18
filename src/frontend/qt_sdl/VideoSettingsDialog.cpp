@@ -48,20 +48,18 @@ void VideoSettingsDialog::setEnabled()
     bool softwareRenderer = renderer == renderer3D_Software;
     ui->cbGLDisplay->setEnabled(softwareRenderer);
     ui->cbSoftwareThreaded->setEnabled(softwareRenderer);
-    ui->cbxGLResolution->setEnabled(!softwareRenderer);
+    ui->cbxResolution->setEnabled(!softwareRenderer);
     ui->cbBetterPolygons->setEnabled(renderer == renderer3D_OpenGL);
     bool computeRenderer = renderer == renderer3D_OpenGLCompute;
 #ifdef VKRENDERER_ENABLED
-    computeRenderer |= renderer == renderer3D_VulkanCompute;
-    computeRenderer |= renderer == renderer3D_VulkanFull;
+    computeRenderer |= renderer == renderer3D_Vulkan;
 #endif
     ui->cbxComputeHiResCoords->setEnabled(computeRenderer);
 
-    // the dither/texture-filter enhancements are implemented in the full
-    // Vulkan renderer only
+    // The dither/texture-filter enhancements are Vulkan-only.
     bool vulkanRenderer = false;
 #ifdef VKRENDERER_ENABLED
-    vulkanRenderer = renderer == renderer3D_VulkanFull;
+    vulkanRenderer = renderer == renderer3D_Vulkan;
 #endif
     ui->cbDither->setEnabled(vulkanRenderer);
     ui->cbTexFilter->setEnabled(vulkanRenderer);
@@ -80,25 +78,21 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     oldVSync = cfg.GetBool("Screen.VSync");
     oldVSyncInterval = cfg.GetInt("Screen.VSyncInterval");
     oldSoftThreaded = cfg.GetBool("3D.Soft.Threaded");
-    oldGLScale = cfg.GetInt("3D.GL.ScaleFactor");
+    oldScaleFactor = cfg.GetInt("3D.ScaleFactor");
     oldGLBetterPolygons = cfg.GetBool("3D.GL.BetterPolygons");
-    oldHiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates");
-    oldDither = cfg.GetBool("3D.GL.Dither");
-    oldTexFilter = cfg.GetBool("3D.GL.TexFilter");
+    oldHiresCoordinates = cfg.GetBool("3D.HiresCoordinates");
+    oldDither = cfg.GetBool("3D.Vulkan.Dither");
+    oldTexFilter = cfg.GetBool("3D.Vulkan.TexFilter");
 
     grp3DRenderer = new QButtonGroup(this);
     grp3DRenderer->addButton(ui->rb3DSoftware, renderer3D_Software);
     grp3DRenderer->addButton(ui->rb3DOpenGL,   renderer3D_OpenGL);
     grp3DRenderer->addButton(ui->rb3DCompute,  renderer3D_OpenGLCompute);
 #ifdef VKRENDERER_ENABLED
-    grp3DRenderer->addButton(ui->rb3DVulkanFull, renderer3D_VulkanFull);
+    grp3DRenderer->addButton(ui->rb3DVulkan, renderer3D_Vulkan);
 #else
-    ui->rb3DVulkanFull->hide();
-#endif
-    // the hybrid renderer (Vulkan 3D + OpenGL 2D) was a stepping stone to
-    // the full Vulkan renderer, which supersedes it; keep it working for a
-    // config that still selects it, but drop it from the menu
     ui->rb3DVulkan->hide();
+#endif
 #if QT_VERSION < QT_VERSION_CHECK(5, 15, 0)
     connect(grp3DRenderer, SIGNAL(buttonClicked(int)), this, SLOT(onChange3DRenderer(int)));
 #else
@@ -120,8 +114,8 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
 #ifdef VKRENDERER_ENABLED
     if (!melonDS::VK::IsRuntimeAvailable())
     {
-        ui->rb3DVulkanFull->setEnabled(false);
-        ui->rb3DVulkanFull->setToolTip(tr("No Vulkan runtime was found on this system."));
+        ui->rb3DVulkan->setEnabled(false);
+        ui->rb3DVulkan->setToolTip(tr("No Vulkan runtime was found on this system."));
     }
 #endif
 
@@ -133,8 +127,8 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ui->cbSoftwareThreaded->setChecked(oldSoftThreaded);
 
     for (int i = 1; i <= 16; i++)
-        ui->cbxGLResolution->addItem(QString("%1x native (%2x%3)").arg(i).arg(256*i).arg(192*i));
-    ui->cbxGLResolution->setCurrentIndex(oldGLScale-1);
+        ui->cbxResolution->addItem(QString("%1x native (%2x%3)").arg(i).arg(256*i).arg(192*i));
+    ui->cbxResolution->setCurrentIndex(oldScaleFactor-1);
 
     ui->cbBetterPolygons->setChecked(oldGLBetterPolygons != 0);
     ui->cbxComputeHiResCoords->setChecked(oldHiresCoordinates != 0);
@@ -168,7 +162,7 @@ void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
         return;
     }
 
-    bool old_gl = UsesGL();
+    bool oldGL = UsesGL();
 
     auto& cfg = emuInstance->getGlobalConfig();
     cfg.SetInt("3D.Renderer", oldRenderer);
@@ -176,13 +170,13 @@ void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
     cfg.SetBool("Screen.VSync", oldVSync);
     cfg.SetInt("Screen.VSyncInterval", oldVSyncInterval);
     cfg.SetBool("3D.Soft.Threaded", oldSoftThreaded);
-    cfg.SetInt("3D.GL.ScaleFactor", oldGLScale);
+    cfg.SetInt("3D.ScaleFactor", oldScaleFactor);
     cfg.SetBool("3D.GL.BetterPolygons", oldGLBetterPolygons);
-    cfg.SetBool("3D.GL.HiresCoordinates", oldHiresCoordinates);
-    cfg.SetBool("3D.GL.Dither", oldDither);
-    cfg.SetBool("3D.GL.TexFilter", oldTexFilter);
+    cfg.SetBool("3D.HiresCoordinates", oldHiresCoordinates);
+    cfg.SetBool("3D.Vulkan.Dither", oldDither);
+    cfg.SetBool("3D.Vulkan.TexFilter", oldTexFilter);
 
-    emit updateVideoSettings(old_gl != UsesGL());
+    emit updateVideoSettings(oldGL != UsesGL());
 
     closeDlg();
 }
@@ -195,26 +189,26 @@ void VideoSettingsDialog::setVsyncControlEnable(bool hasOGL)
 
 void VideoSettingsDialog::onChange3DRenderer(int renderer)
 {
-    bool old_gl = UsesGL();
+    bool oldGL = UsesGL();
 
     auto& cfg = emuInstance->getGlobalConfig();
     cfg.SetInt("3D.Renderer", renderer);
 
     setEnabled();
 
-    emit updateVideoSettings(old_gl != UsesGL());
+    emit updateVideoSettings(oldGL != UsesGL());
 }
 
 void VideoSettingsDialog::on_cbGLDisplay_stateChanged(int state)
 {
-    bool old_gl = UsesGL();
+    bool oldGL = UsesGL();
 
     auto& cfg = emuInstance->getGlobalConfig();
     cfg.SetBool("Screen.UseGL", (state != 0));
 
     setVsyncControlEnable(UsesGL());
 
-    emit updateVideoSettings(old_gl != UsesGL());
+    emit updateVideoSettings(oldGL != UsesGL());
 }
 
 void VideoSettingsDialog::on_cbVSync_stateChanged(int state)
@@ -244,13 +238,13 @@ void VideoSettingsDialog::on_cbSoftwareThreaded_stateChanged(int state)
     emit updateVideoSettings(false);
 }
 
-void VideoSettingsDialog::on_cbxGLResolution_currentIndexChanged(int idx)
+void VideoSettingsDialog::on_cbxResolution_currentIndexChanged(int idx)
 {
     // prevent a spurious change
-    if (ui->cbxGLResolution->count() < 16) return;
+    if (ui->cbxResolution->count() < 16) return;
 
     auto& cfg = emuInstance->getGlobalConfig();
-    cfg.SetInt("3D.GL.ScaleFactor", idx+1);
+    cfg.SetInt("3D.ScaleFactor", idx+1);
 
     setVsyncControlEnable(UsesGL());
 
@@ -268,7 +262,7 @@ void VideoSettingsDialog::on_cbBetterPolygons_stateChanged(int state)
 void VideoSettingsDialog::on_cbxComputeHiResCoords_stateChanged(int state)
 {
     auto& cfg = emuInstance->getGlobalConfig();
-    cfg.SetBool("3D.GL.HiresCoordinates", (state != 0));
+    cfg.SetBool("3D.HiresCoordinates", (state != 0));
 
     emit updateVideoSettings(false);
 }
@@ -276,7 +270,7 @@ void VideoSettingsDialog::on_cbxComputeHiResCoords_stateChanged(int state)
 void VideoSettingsDialog::on_cbDither_stateChanged(int state)
 {
     auto& cfg = emuInstance->getGlobalConfig();
-    cfg.SetBool("3D.GL.Dither", (state != 0));
+    cfg.SetBool("3D.Vulkan.Dither", (state != 0));
 
     emit updateVideoSettings(false);
 }
@@ -284,7 +278,7 @@ void VideoSettingsDialog::on_cbDither_stateChanged(int state)
 void VideoSettingsDialog::on_cbTexFilter_stateChanged(int state)
 {
     auto& cfg = emuInstance->getGlobalConfig();
-    cfg.SetBool("3D.GL.TexFilter", (state != 0));
+    cfg.SetBool("3D.Vulkan.TexFilter", (state != 0));
 
     emit updateVideoSettings(false);
 }

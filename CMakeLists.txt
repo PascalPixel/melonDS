@@ -26,6 +26,7 @@ include(CheckSymbolExists)
 include(CheckLibraryExists)
 include(CMakeDependentOption)
 include(CheckIPOSupported)
+include(CTest)
 
 include(SetupCCache)
 include(Sanitizers)
@@ -76,6 +77,8 @@ else()
     set(VKRENDERER_DEFAULT OFF)
 endif()
 cmake_dependent_option(ENABLE_VKRENDERER "Enable Vulkan compute renderer" ${VKRENDERER_DEFAULT} "ENABLE_OGLRENDERER" OFF)
+cmake_dependent_option(ENABLE_VULKAN_SMOKE_TEST "Build the headless Vulkan CI smoke test" OFF
+    "BUILD_TESTING;ENABLE_VKRENDERER" OFF)
 
 check_ipo_supported(RESULT IPO_SUPPORTED)
 cmake_dependent_option(ENABLE_LTO_RELEASE "Enable link-time optimizations for release builds" ON "IPO_SUPPORTED" OFF)
@@ -116,6 +119,10 @@ endif()
 option(BUILD_QT_SDL "Build Qt/SDL frontend" ON)
 
 add_subdirectory(src)
+
+if (BUILD_TESTING)
+    add_subdirectory(tests)
+endif()
 
 if (BUILD_QT_SDL)
     add_subdirectory(src/frontend/qt_sdl)

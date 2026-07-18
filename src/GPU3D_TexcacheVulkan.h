@@ -16,8 +16,8 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-#ifndef GPU3D_TEXCACHEVULKAN
-#define GPU3D_TEXCACHEVULKAN
+#ifndef GPU3D_TEXCACHEVULKAN_H
+#define GPU3D_TEXCACHEVULKAN_H
 
 #include "GPU3D_Texcache.h"
 #include "VulkanSupport.h"
@@ -32,6 +32,7 @@ class Texcache;
 struct VulkanTexArray
 {
     VK::Context::Image Image;
+    bool Valid = false;
 };
 
 class TexcacheVulkanLoader
@@ -40,7 +41,9 @@ public:
     explicit TexcacheVulkanLoader(VK::Context* ctx) : Ctx(ctx) {}
 
     VulkanTexArray* GenerateTexture(u32 width, u32 height, u32 layers) const;
-    void UploadTexture(VulkanTexArray* handle, u32 width, u32 height, u32 layer, void* data) const;
+    bool IsValid(VulkanTexArray* handle) const { return handle && handle->Valid; }
+    bool UploadTexture(VulkanTexArray* handle, u32 width, u32 height, u32 layer,
+                       void* data) const;
     void DeleteTexture(VulkanTexArray* handle) const;
 
 private:
@@ -51,4 +54,4 @@ using TexcacheVulkan = Texcache<TexcacheVulkanLoader, VulkanTexArray*>;
 
 }
 
-#endif
+#endif // GPU3D_TEXCACHEVULKAN_H

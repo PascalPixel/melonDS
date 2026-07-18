@@ -80,7 +80,7 @@ private:
     void UseRenderShader(bool wbuffer);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const;
-    void BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
+    bool BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
     void SetupPolygonTexture(const RendererPolygon* poly) const;
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;

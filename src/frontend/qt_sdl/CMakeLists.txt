@@ -244,15 +244,6 @@ if (APPLE)
     option(MACOS_BUNDLE_LIBS "Bundle libraries with the app on macOS" OFF)
     option(MACOS_BUILD_DMG "Build DMG image of the macOS application bundle" OFF)
 
-    if (MACOS_BUNDLE_LIBS)
-        if (MACOS_BUILD_DMG)
-            set(DMGARG "--dmg")
-        endif()
-        add_custom_command(TARGET melonDS POST_BUILD
-            COMMAND ${CMAKE_SOURCE_DIR}/tools/mac-libs.rb ${DMGARG} ${CMAKE_BINARY_DIR}
-            COMMENT "Bundling macOS libraries...")
-    endif()
-
     if (ENABLE_VKRENDERER)
         # The Vulkan compute renderer loads MoltenVK at runtime (it is not
         # linked), so ship it inside the bundle to keep the app
@@ -265,6 +256,28 @@ if (APPLE)
             PATHS /opt/homebrew/lib /usr/local/lib)
 
         if (MOLTENVK_LIBRARY)
+            execute_process(
+                COMMAND lipo -archs "${MOLTENVK_LIBRARY}"
+                OUTPUT_VARIABLE MOLTENVK_ARCHITECTURES
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE MOLTENVK_LIPO_RESULT)
+            if (NOT MOLTENVK_LIPO_RESULT EQUAL 0)
+                message(FATAL_ERROR "Could not inspect MoltenVK architectures: ${MOLTENVK_LIBRARY}")
+            endif()
+
+            set(MOLTENVK_REQUIRED_ARCHITECTURES "${CMAKE_OSX_ARCHITECTURES}")
+            if (NOT MOLTENVK_REQUIRED_ARCHITECTURES)
+                set(MOLTENVK_REQUIRED_ARCHITECTURES "${CMAKE_SYSTEM_PROCESSOR}")
+            endif()
+            foreach(MOLTENVK_REQUIRED_ARCH IN LISTS MOLTENVK_REQUIRED_ARCHITECTURES)
+                if (NOT " ${MOLTENVK_ARCHITECTURES} " MATCHES " ${MOLTENVK_REQUIRED_ARCH} ")
+                    message(FATAL_ERROR
+                        "MoltenVK at ${MOLTENVK_LIBRARY} does not contain ${MOLTENVK_REQUIRED_ARCH} "
+                        "(available: ${MOLTENVK_ARCHITECTURES}). Run tools/fetch-moltenvk.sh to stage "
+                        "the official universal library before configuring.")
+                endif()
+            endforeach()
+
             message(STATUS "Bundling MoltenVK: ${MOLTENVK_LIBRARY}")
             # copy MoltenVK in and rewrite its install-name to an @rpath id, so
             # a Homebrew/SDK source path doesn't linger in the shipped bundle
@@ -275,13 +288,28 @@ if (APPLE)
             # (ad-hoc) after rewriting the id
             add_custom_command(TARGET melonDS POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Frameworks"
+                COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Resources/ThirdPartyLicenses"
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different "${MOLTENVK_LIBRARY}" "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Frameworks/libMoltenVK.dylib"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/res/licenses/MoltenVK-LICENSE.txt" "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Resources/ThirdPartyLicenses/MoltenVK-LICENSE.txt"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/res/licenses/MoltenVK-NOTICE.txt" "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Resources/ThirdPartyLicenses/MoltenVK-NOTICE.txt"
                 COMMAND install_name_tool -id "@rpath/libMoltenVK.dylib" "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Frameworks/libMoltenVK.dylib"
                 COMMAND codesign --force --sign - "$<TARGET_BUNDLE_CONTENT_DIR:melonDS>/Frameworks/libMoltenVK.dylib"
                 COMMENT "Bundling MoltenVK...")
         else()
             message(WARNING "MoltenVK not found - the Vulkan renderer will only work with a system-wide Vulkan runtime. Run tools/fetch-moltenvk.sh or install molten-vk to bundle it.")
         endif()
+    endif()
+
+    # Keep this last: mac-libs.rb fixes every bundled dependency and then
+    # deep-signs the completed app. No files may be inserted afterward or the
+    # outer bundle's resource seal becomes invalid.
+    if (MACOS_BUNDLE_LIBS)
+        if (MACOS_BUILD_DMG)
+            set(DMGARG "--dmg")
+        endif()
+        add_custom_command(TARGET melonDS POST_BUILD
+            COMMAND ${CMAKE_SOURCE_DIR}/tools/mac-libs.rb ${DMGARG} ${CMAKE_BINARY_DIR}
+            COMMENT "Bundling macOS libraries...")
     endif()
 endif()
 

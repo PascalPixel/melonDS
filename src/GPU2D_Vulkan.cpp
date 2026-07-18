@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <string.h>
 #include <stddef.h>
+#include <new>
 #include "GPU_Vulkan.h"
 #include "GPU2D_Vulkan.h"
 #include "GPU2D_Soft.h"
@@ -283,7 +284,11 @@ bool VulkanRenderer2D::InitShaders()
         delete[] mosaic_tex;
         return false;
     }
-    Ctx.UploadImageLayer(MosaicImg, mosaic_tex, 256, 16, 0, 1);
+    if (!Ctx.UploadImageLayer(MosaicImg, mosaic_tex, 256, 16, 0, 1))
+    {
+        delete[] mosaic_tex;
+        return false;
+    }
 
     delete[] mosaic_tex;
     return true;
@@ -404,6 +409,8 @@ bool VulkanRenderer2D::Init()
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, true))
         return false;
     memcpy(RectVtxBuffer.Map, rectvertices, sizeof(rectvertices));
+    if (!Ctx.FlushBuffer(RectVtxBuffer, 0, sizeof(rectvertices)))
+        return false;
 
     // generate textures to hold raw BG and OBJ VRAM and palettes
 
@@ -482,8 +489,9 @@ bool VulkanRenderer2D::Init()
         return false;
 
     const u32 zeroPixel = 0;
-    Ctx.UploadImageLayer(DummyTex, &zeroPixel, 1, 1, 0, 4);
-    Ctx.UploadImageLayer(DummyTexArray, &zeroPixel, 1, 1, 0, 4);
+    if (!Ctx.UploadImageLayer(DummyTex, &zeroPixel, 1, 1, 0, 4) ||
+        !Ctx.UploadImageLayer(DummyTexArray, &zeroPixel, 1, 1, 0, 4))
+        return false;
 
     // generate UBOs
 
@@ -534,26 +542,17 @@ bool VulkanRenderer2D::Init()
     // descriptor pool; sets are cached per combination of variable
     // bindings, see GetDescriptorSet()
 
-    {
-        const u32 maxSets = 256;
-        VkDescriptorPoolSize sizes[] = {
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * maxSets},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * maxSets},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 11 * maxSets},
-        };
-        VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        poolInfo.maxSets = maxSets;
-        poolInfo.poolSizeCount = 3;
-        poolInfo.pPoolSizes = sizes;
-        if (VK::vkCreateDescriptorPool(Ctx.Device, &poolInfo, nullptr, &DescPool) != VK_SUCCESS)
+    for (sDescriptorArena& arena : DescriptorArenas)
+        if (!AddDescriptorPool(arena))
             return false;
-    }
 
     // move every sampled image into a defined layout; the sampled-and-
     // rendered images sit in SHADER_READ_ONLY_OPTIMAL between passes
 
     {
         VkCommandBuffer cmd = Ctx.BeginOneShot();
+        if (cmd == VK_NULL_HANDLE)
+            return false;
         auto toSampled = [&](VK::Context::Image& img)
         {
             Ctx.TransitionImage(cmd, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -567,7 +566,8 @@ bool VulkanRenderer2D::Init()
         for (int i = 0; i < 22; i++)
             toSampled(AllBGLayerImg[i]);
         toSampled(SpriteImg);
-        Ctx.EndOneShot(cmd);
+        if (!Ctx.EndOneShot(cmd))
+            return false;
     }
 
     return true;
@@ -581,7 +581,9 @@ VulkanRenderer2D::~VulkanRenderer2D()
 
         DestroyScaleDependentResources();
 
-        if (DescPool) VK::vkDestroyDescriptorPool(Ctx.Device, DescPool, nullptr);
+        for (sDescriptorArena& arena : DescriptorArenas)
+            for (VkDescriptorPool pool : arena.Pools)
+                VK::vkDestroyDescriptorPool(Ctx.Device, pool, nullptr);
 
         if (SpriteFB) VK::vkDestroyFramebuffer(Ctx.Device, SpriteFB, nullptr);
         for (int i = 0; i < 22; i++)
@@ -645,9 +647,46 @@ void VulkanRenderer2D::DestroyScaleDependentResources()
 
 void VulkanRenderer2D::InvalidateDescriptorCache()
 {
-    if (DescPool != VK_NULL_HANDLE)
-        VK::vkResetDescriptorPool(Ctx.Device, DescPool, 0);
-    DescCache.clear();
+    for (sDescriptorArena& arena : DescriptorArenas)
+    {
+        for (VkDescriptorPool pool : arena.Pools)
+            VK::vkResetDescriptorPool(Ctx.Device, pool, 0);
+        arena.Cache.clear();
+    }
+}
+
+bool VulkanRenderer2D::BeginFrame(int frameSlot)
+{
+    if (frameSlot < 0 || frameSlot >= 2)
+        return false;
+
+    DescriptorArena = frameSlot;
+    sDescriptorArena& arena = DescriptorArenas[DescriptorArena];
+    for (VkDescriptorPool pool : arena.Pools)
+        if (VK::vkResetDescriptorPool(Ctx.Device, pool, 0) != VK_SUCCESS)
+            return false;
+    arena.Cache.clear();
+    return true;
+}
+
+bool VulkanRenderer2D::AddDescriptorPool(sDescriptorArena& arena)
+{
+    constexpr u32 maxSets = 256;
+    VkDescriptorPoolSize sizes[] = {
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * maxSets},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * maxSets},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 11 * maxSets},
+    };
+    VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = maxSets;
+    poolInfo.poolSizeCount = 3;
+    poolInfo.pPoolSizes = sizes;
+
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (VK::vkCreateDescriptorPool(Ctx.Device, &poolInfo, nullptr, &pool) != VK_SUCCESS)
+        return false;
+    arena.Pools.push_back(pool);
+    return true;
 }
 
 void VulkanRenderer2D::Reset()
@@ -656,6 +695,10 @@ void VulkanRenderer2D::Reset()
     memset(SoftFrameBuffer, 0, sizeof(SoftFrameBuffer));
     SoftFlushedLine = 0;
     UseSoftware2D = false;
+    SoftwareFallbackFrames = 0;
+    SoftwareFallbackForVCount = false;
+    SoftSpriteLine = 0;
+    SoftSpritePrepared = false;
     CompositeBands = 0;
     SawVCountMismatch = false;
 
@@ -708,51 +751,79 @@ void VulkanRenderer2D::PostSavestate()
 }
 
 
-void VulkanRenderer2D::SetScaleFactor(int scale)
+bool VulkanRenderer2D::SetScaleFactor(int scale)
 {
-    if (scale == ScaleFactor)
-        return;
+    if (scale == ScaleFactor && OutputImg.Img != VK_NULL_HANDLE)
+        return true;
 
     if (!Ctx.Valid)
-        return;
+        return false;
 
-    VK::vkDeviceWaitIdle(Ctx.Device);
+    if (VK::vkDeviceWaitIdle(Ctx.Device) != VK_SUCCESS)
+        return false;
 
     DestroyScaleDependentResources();
 
     ScaleFactor = scale;
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
-    SoftUploadBuffer.resize(ScreenW * ScreenH);
+    auto fail = [&](const char* resource)
+    {
+        Log(LogLevel::Error,
+            "GPU2D_Vulkan: failed to allocate scale-dependent %s at %dx\n",
+            resource, scale);
+        DestroyScaleDependentResources();
+        ScaleFactor = -1;
+        ScreenW = 0;
+        ScreenH = 0;
+        return false;
+    };
+
+    try
+    {
+        SoftUploadBuffer.resize((size_t)ScreenW * ScreenH);
+    }
+    catch (const std::bad_alloc&)
+    {
+        return fail("software upload storage");
+    }
 
     // final (upscaled) sprite layer: a 2-layer array (color + flags)
     // rendered as two color attachments, plus a D16 depth buffer
     // (GL: OBJLayerTex + OBJDepthTex + OBJLayerFB with two draw buffers)
 
-    Ctx.CreateImage(OBJLayerImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenW, ScreenH, 2,
-                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, true);
-    Ctx.CreateLayerView(OBJLayerView[0], OBJLayerImg, 0);
-    Ctx.CreateLayerView(OBJLayerView[1], OBJLayerImg, 1);
+    if (!Ctx.CreateImage(OBJLayerImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenW, ScreenH, 2,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, true))
+        return fail("OBJ layers");
+    if (!Ctx.CreateLayerView(OBJLayerView[0], OBJLayerImg, 0) ||
+        !Ctx.CreateLayerView(OBJLayerView[1], OBJLayerImg, 1))
+        return fail("OBJ layer views");
 
-    Ctx.CreateImage(OBJDepthImg, VK_FORMAT_D16_UNORM, ScreenW, ScreenH, 1,
-                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, false);
+    if (!Ctx.CreateImage(OBJDepthImg, VK_FORMAT_D16_UNORM, ScreenW, ScreenH, 1,
+                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, false))
+        return fail("OBJ depth buffer");
 
-    Ctx.CreateFramebufferMulti(OBJLayerFB, RPObjLoad,
-                               {OBJLayerView[0], OBJLayerView[1], OBJDepthImg.View},
-                               ScreenW, ScreenH);
+    if (!Ctx.CreateFramebufferMulti(OBJLayerFB, RPObjLoad,
+                                    {OBJLayerView[0], OBJLayerView[1], OBJDepthImg.View},
+                                    ScreenW, ScreenH))
+        return fail("OBJ framebuffer");
 
     // compositor output
 
-    Ctx.CreateImage(OutputImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenW, ScreenH, 1,
-                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false);
-    Ctx.CreateFramebuffer(OutputFB, RPColorLoad, OutputImg, 0);
+    if (!Ctx.CreateImage(OutputImg, VK_FORMAT_R8G8B8A8_UNORM, ScreenW, ScreenH, 1,
+                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, false))
+        return fail("compositor output");
+    if (!Ctx.CreateFramebuffer(OutputFB, RPColorLoad, OutputImg, 0))
+        return fail("compositor framebuffer");
 
     // initial layouts: color targets sit in SHADER_READ_ONLY_OPTIMAL
     // between passes, the depth buffer permanently in
     // DEPTH_STENCIL_ATTACHMENT_OPTIMAL
     {
         VkCommandBuffer cmd = Ctx.BeginOneShot();
+        if (cmd == VK_NULL_HANDLE)
+            return fail("layout command buffer");
 
         Ctx.TransitionImage(cmd, OBJLayerImg, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
@@ -778,11 +849,13 @@ void VulkanRenderer2D::SetScaleFactor(int scale)
             0, 0, nullptr, 0, nullptr, 1, &barrier);
         OBJDepthImg.Layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-        Ctx.EndOneShot(cmd);
+        if (!Ctx.EndOneShot(cmd))
+            return fail("layout submission");
     }
 
     // the OBJ layer view baked into the cached descriptor sets changed
     InvalidateDescriptorCache();
+    return true;
 }
 
 void VulkanRenderer2D::SetSharedResources(const SharedResources& shared)
@@ -875,7 +948,7 @@ void VulkanRenderer2D::RetryStagingUploads()
     SpriteDirty = true;
 }
 
-void VulkanRenderer2D::PushConfig(sConfigRing& ring, const void* data, u32 size)
+bool VulkanRenderer2D::PushConfig(sConfigRing& ring, const void* data, u32 size)
 {
     // GL updates these configs with glBufferSubData mid-frame and relies
     // on the driver to keep already-issued draws consistent; here each
@@ -889,26 +962,32 @@ void VulkanRenderer2D::PushConfig(sConfigRing& ring, const void* data, u32 size)
                 ring.Slots);
             ring.Overflowed = true;
         }
-        return;
+        return false;
     }
 
     ring.CurOffset = ring.Next * ring.Stride;
     memcpy(ring.Host.data() + ring.CurOffset, data, size);
     ring.Next++;
+    return true;
 }
 
-void VulkanRenderer2D::FlushMappedBuffers()
+bool VulkanRenderer2D::FlushMappedBuffers()
 {
-    auto flushRing = [](sRingBuffer& ring)
+    bool success = true;
+    auto flushRing = [&](sRingBuffer& ring)
     {
         if (ring.Offset)
+        {
             memcpy(ring.Buf.Map, ring.Host.data(), ring.Offset);
+            success &= Ctx.FlushBuffer(ring.Buf, 0, ring.Offset);
+        }
         ring.Offset = 0;
         ring.Overflowed = false;
     };
-    auto flushConfig = [](sConfigRing& ring)
+    auto flushConfig = [&](sConfigRing& ring)
     {
         memcpy(ring.Buf.Map, ring.Host.data(), ring.Host.size());
+        success &= Ctx.FlushBuffer(ring.Buf, 0, ring.Host.size());
         ring.Next = 0;
         ring.CurOffset = 0;
         ring.Overflowed = false;
@@ -921,13 +1000,18 @@ void VulkanRenderer2D::FlushMappedBuffers()
     flushConfig(SpriteConfigRing);
     flushConfig(CompositorConfigRing);
     memcpy(ScanlineConfigUBO.Map, ScanlineConfigHost.data(), ScanlineConfigHost.size());
+    success &= Ctx.FlushBuffer(ScanlineConfigUBO, 0, ScanlineConfigHost.size());
     memcpy(SpriteScanlineConfigUBO.Map, SpriteScanlineConfigHost.data(),
            SpriteScanlineConfigHost.size());
+    success &= Ctx.FlushBuffer(SpriteScanlineConfigUBO, 0,
+                               SpriteScanlineConfigHost.size());
+    return success;
 }
 
 VkDescriptorSet VulkanRenderer2D::GetDescriptorSet(VkImageView vram, VkImageView pal,
                                                    const VkImageView* bgViews, const VkSampler* bgSamplers)
 {
+    sDescriptorArena& arena = DescriptorArenas[DescriptorArena];
     std::array<uintptr_t, 10> key = {
         (uintptr_t)vram, (uintptr_t)pal,
         (uintptr_t)bgViews[0], (uintptr_t)bgSamplers[0],
@@ -935,20 +1019,34 @@ VkDescriptorSet VulkanRenderer2D::GetDescriptorSet(VkImageView vram, VkImageView
         (uintptr_t)bgViews[2], (uintptr_t)bgSamplers[2],
         (uintptr_t)bgViews[3], (uintptr_t)bgSamplers[3],
     };
-    auto it = DescCache.find(key);
-    if (it != DescCache.end())
+    auto it = arena.Cache.find(key);
+    if (it != arena.Cache.end())
         return it->second;
 
     VkDescriptorSetAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    allocInfo.descriptorPool = DescPool;
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &SetLayout;
 
     VkDescriptorSet set = VK_NULL_HANDLE;
-    if (VK::vkAllocateDescriptorSets(Ctx.Device, &allocInfo, &set) != VK_SUCCESS)
+    for (auto it = arena.Pools.rbegin(); it != arena.Pools.rend(); ++it)
     {
-        Log(LogLevel::Error, "GPU2D_Vulkan: descriptor pool exhausted\n");
-        return VK_NULL_HANDLE;
+        allocInfo.descriptorPool = *it;
+        if (VK::vkAllocateDescriptorSets(Ctx.Device, &allocInfo, &set) == VK_SUCCESS)
+            break;
+    }
+    if (set == VK_NULL_HANDLE)
+    {
+        if (!AddDescriptorPool(arena))
+        {
+            Log(LogLevel::Error, "GPU2D_Vulkan: failed to grow descriptor pool\n");
+            return VK_NULL_HANDLE;
+        }
+        allocInfo.descriptorPool = arena.Pools.back();
+        if (VK::vkAllocateDescriptorSets(Ctx.Device, &allocInfo, &set) != VK_SUCCESS)
+        {
+            Log(LogLevel::Error, "GPU2D_Vulkan: failed to allocate descriptor set\n");
+            return VK_NULL_HANDLE;
+        }
     }
 
     VkImageView objView = OBJLayerImg.View ? OBJLayerImg.View : DummyTexArray.View;
@@ -1002,7 +1100,7 @@ VkDescriptorSet VulkanRenderer2D::GetDescriptorSet(VkImageView vram, VkImageView
     }
     VK::vkUpdateDescriptorSets(Ctx.Device, 16, writes, 0, nullptr);
 
-    DescCache.emplace(key, set);
+    arena.Cache.emplace(key, set);
     return set;
 }
 
@@ -1111,7 +1209,7 @@ void VulkanRenderer2D::DepthTargetBarrier()
     barrier.image = OBJDepthImg.Img;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
     VK::vkCmdPipelineBarrier(CurCmd,
-        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
@@ -1360,7 +1458,8 @@ void VulkanRenderer2D::UpdateAndRender(int line)
     EVY = GPU2D.EVY;
 
     if (layer_pre_dirty || LayerConfigDirty)
-        UpdateLayerConfig();
+        if (!UpdateLayerConfig())
+            return;
 
     UpdateScanlineConfig(line);
 
@@ -1466,7 +1565,8 @@ void VulkanRenderer2D::UpdateAndRender(int line)
         // TODO make this only do it over the required subsection?
         NumSprites = 0;
         SpriteUseMosaic = false;
-        UpdateOAM(0, 192);
+        if (!UpdateOAM(0, 192))
+            return;
 
         memcpy(&TempPalBuffer[0], &GPU.Palette[GPU2D.Num ? 0x600 : 0x200], 256*2);
         {
@@ -1557,12 +1657,40 @@ void VulkanRenderer2D::FlushSoftwareLines(u32 endLine)
         SoftFlushedLine = endLine;
 }
 
+void VulkanRenderer2D::SwitchToSoftware(u32 line)
+{
+    Flush(line);
+    if (!SoftSpritePrepared || SoftSpriteLine != line)
+    {
+        SoftFallback->Reset();
+        SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
+    }
+    SoftFlushedLine = line;
+    UseSoftware2D = true;
+    SoftwareFallbackFrames = 0;
+    SoftwareFallbackForVCount = true;
+}
+
+void VulkanRenderer2D::SwitchToHardware(u32 line)
+{
+    FlushSoftwareLines(line);
+    Reset();
+    RetryStagingUploads();
+    LastLine = line;
+    LastSpriteLine = line;
+}
+
 void VulkanRenderer2D::DrawScanline(u32 line)
 {
     if (CurCmd == VK_NULL_HANDLE)
         return;
 
     SawVCountMismatch |= line != GPU.VCount;
+
+    if (!UseSoftware2D && line != GPU.VCount)
+        SwitchToSoftware(line);
 
     if (UseSoftware2D)
         DrawSoftwareLine(line);
@@ -1591,7 +1719,12 @@ void VulkanRenderer2D::FinishFrame(u32 endLine)
     Flush(endLine);
 
     if (UseSoftware2D)
+    {
         SoftFlushedLine = 0;
+        if ((SoftwareFallbackForVCount && !SawVCountMismatch) ||
+            (!SoftwareFallbackForVCount && ++SoftwareFallbackFrames >= 120))
+            SwitchToHardware(0);
+    }
     else if (CurCmd != VK_NULL_HANDLE)
     {
 
@@ -1600,10 +1733,12 @@ void VulkanRenderer2D::FinishFrame(u32 endLine)
         // scanlines can therefore turn one frame into hundreds of full GPU
         // passes. At modest scale factors, the scanline-accurate software
         // compositor is both faster and exact; 3D is read back once per frame.
-        if (ScaleFactor <= 4 && (CompositeBands > 64 || SawVCountMismatch))
+        if (ScaleFactor <= 4 && CompositeBands > 64)
         {
             SoftFallback->Reset();
             UseSoftware2D = true;
+            SoftwareFallbackFrames = 0;
+            SoftwareFallbackForVCount = false;
         }
     }
 
@@ -1821,7 +1956,7 @@ void VulkanRenderer2D::UpdateScanlineConfig(int line)
     }
 };
 
-void VulkanRenderer2D::UpdateLayerConfig()
+bool VulkanRenderer2D::UpdateLayerConfig()
 {
     // determine which parts of VRAM were used for captures
     int capturemask = GPU2D.Num ? 0x7 : 0x1F;
@@ -2090,10 +2225,10 @@ void VulkanRenderer2D::UpdateLayerConfig()
         }
     }
 
-    PushConfig(LayerConfigRing, &LayerConfig, sizeof(LayerConfig));
+    return PushConfig(LayerConfigRing, &LayerConfig, sizeof(LayerConfig));
 }
 
-void VulkanRenderer2D::UpdateOAM(int ystart, int yend)
+bool VulkanRenderer2D::UpdateOAM(int ystart, int yend)
 {
     auto& cfg = SpriteConfig;
     u16* oam = OAM;
@@ -2319,11 +2454,12 @@ void VulkanRenderer2D::UpdateOAM(int ystart, int yend)
             SpriteUseMosaic = true;
     }
 
-    PushConfig(SpriteConfigRing, &cfg,
-               offsetof(sSpriteConfig, uOAM) + (NumSprites * sizeof(cfg.uOAM[0])));
+    return PushConfig(SpriteConfigRing, &cfg,
+                      offsetof(sSpriteConfig, uOAM) +
+                      (NumSprites * sizeof(cfg.uOAM[0])));
 }
 
-void VulkanRenderer2D::UpdateCompositorConfig()
+bool VulkanRenderer2D::UpdateCompositorConfig()
 {
     // compositor info buffer
     for (int i = 0; i < 4; i++)
@@ -2348,7 +2484,7 @@ void VulkanRenderer2D::UpdateCompositorConfig()
     CompositorConfig.uBlendCoef[1] = EVB;
     CompositorConfig.uBlendCoef[2] = EVY;
 
-    PushConfig(CompositorConfigRing, &CompositorConfig, sizeof(CompositorConfig));
+    return PushConfig(CompositorConfigRing, &CompositorConfig, sizeof(CompositorConfig));
 }
 
 
@@ -2611,7 +2747,8 @@ void VulkanRenderer2D::RenderScreen(int ystart, int yend)
            &ScanlineConfig.uScanline[ystart],
            (yend - ystart) * sizeof(sScanlineConfig::sScanline));
 
-    UpdateCompositorConfig();
+    if (!UpdateCompositorConfig())
+        return;
 
     // BG layer inputs: the 3D output replaces the BG0 slot when DISPCNT
     // bit3 is set; the per-layer wrap mode (GL: CLAMP_TO_BORDER vs REPEAT
@@ -2655,6 +2792,8 @@ void VulkanRenderer2D::DrawSprites(u32 line)
     if (UseSoftware2D)
     {
         SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
         return;
     }
 
@@ -2755,6 +2894,13 @@ void VulkanRenderer2D::DrawSprites(u32 line)
         SpriteDirty = true;
     if (stagingUploadFailed)
         RetryStagingUploads();
+
+    if (GPU.IsVCountOverridePending(line))
+    {
+        SoftFallback->DrawSprites(line);
+        SoftSpriteLine = line;
+        SoftSpritePrepared = true;
+    }
 }
 
 }
